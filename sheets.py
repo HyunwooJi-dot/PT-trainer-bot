@@ -183,6 +183,37 @@ def save_homework(name: str, date: str, homework: str) -> bool:
         return False
 
 
+def get_completed_without_homework(date: str) -> list[str]:
+    """
+    오늘 수업 완료했지만 숙제가 없는 회원 목록 반환.
+    운동 시트에서 완료=True인데 숙제 시트에 오늘 날짜 기록 없는 회원.
+    """
+    try:
+        workouts  = _sheet("운동").get_all_records()
+        homeworks = _sheet("숙제").get_all_records()
+
+        # 오늘 수업 완료한 회원
+        completed = {
+            str(r.get("회원명", "")).strip()
+            for r in workouts
+            if str(r.get("날짜", "")).strip() == date
+            and str(r.get("완료여부", "")).strip() == "완료"
+        }
+
+        # 오늘 숙제 받은 회원
+        got_homework = {
+            str(r.get("회원명", "")).strip()
+            for r in homeworks
+            if str(r.get("날짜", "")).strip() == date
+        }
+
+        # 완료했지만 숙제 없는 회원
+        return sorted(completed - got_homework)
+    except Exception as e:
+        logger.error(f"[get_completed_without_homework] {e}")
+        return []
+
+
 def get_recent_homework(name: str, limit: int = 3) -> list[dict]:
     """최근 숙제 목록 (AI 생성 시 참고용)"""
     try:
