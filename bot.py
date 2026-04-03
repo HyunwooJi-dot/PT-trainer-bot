@@ -316,18 +316,34 @@ async def register_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def set_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/workout 이름 날짜 운동내용  (볼륨 자동 계산 + 시트 저장)"""
+    """/workout 이름 [날짜] 운동내용  — 날짜 생략 시 오늘 날짜 자동 적용"""
     if not is_trainer(update):
         return
-    if len(context.args) < 3:
+    if len(context.args) < 2:
         await update.message.reply_text(
-            "사용법: `/workout 이름 날짜 운동내용`\n"
-            "예: `/workout 홍길동 2024-03-15 스쿼트105KG 15X3 런지 10KG 덤벨 12X3`",
+            "사용법: `/workout 이름 [날짜] 운동내용`\n\n"
+            "날짜 생략 → 오늘 날짜 자동 적용:\n"
+            "`/workout 지현우 스쿼트105KG 15X3 런지 10KG 덤벨 12X3`\n\n"
+            "날짜 직접 입력:\n"
+            "`/workout 지현우 2026-04-03 스쿼트105KG 15X3 런지 10KG 덤벨 12X3`",
             parse_mode="Markdown"
         )
         return
-    name, date = context.args[0], context.args[1]
-    workout = " ".join(context.args[2:])
+
+    name = context.args[0]
+
+    # 날짜 자동 감지: args[1]이 YYYY-MM-DD 형식이면 날짜로, 아니면 오늘 날짜
+    date_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+    if len(context.args) >= 2 and date_pattern.match(context.args[1]):
+        date = context.args[1]
+        workout = " ".join(context.args[2:])
+    else:
+        date = get_today()
+        workout = " ".join(context.args[1:])
+
+    if not workout.strip():
+        await update.message.reply_text("❌ 운동 내용을 입력해주세요!", parse_mode="Markdown")
+        return
 
     # 운동 저장
     sheets.save_workout(name, date, workout)
@@ -341,6 +357,8 @@ async def set_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = f"✅ *{name}*님 {date} 운동 등록 완료!\n`{workout}`"
     if exercises:
         reply += format_volume_summary(exercises)
+    else:
+        reply += "\n\n⚠️ 볼륨 계산: `운동명 무게KG 횟수X세트` 형식으로 입력해주세요.\n예) `스쿼트105KG 15X3`"
 
     await update.message.reply_text(reply, parse_mode="Markdown")
 
