@@ -5,6 +5,7 @@ Google Sheets 연동 모듈
   시트2: 운동     - 날짜 | 회원명 | 운동내용 | 완료여부 | 완료시간
   시트3: 숙제     - 날짜 | 회원명 | 숙제내용 | 발송상태 | 발송시간
   시트4: 로그     - 시간 | 회원명 | chat_id | 활동유형 | 날짜
+  시트5: 볼륨로그  - 날짜 | 회원명 | 운동명 | 부위 | 무게(KG) | 세트 | 횟수 | 총볼륨(KG)
 """
 
 import os
@@ -188,6 +189,66 @@ def get_recent_homework(name: str, limit: int = 3) -> list[dict]:
         return member_hw[-limit:] if member_hw else []
     except Exception as e:
         logger.error(f"[get_recent_homework] {e}")
+        return []
+
+
+# ─────────────────────────────────────────────
+# 볼륨 로그
+# ─────────────────────────────────────────────
+
+def save_volume_log(name: str, date: str, exercises: list) -> bool:
+    """
+    운동별 볼륨을 '볼륨로그' 시트에 저장.
+    exercises: [{'name', 'weight', 'reps', 'sets', 'volume', 'category'}, ...]
+    컬럼: 날짜 | 회원명 | 운동명 | 부위 | 무게(KG) | 세트 | 횟수 | 총볼륨(KG)
+    """
+    try:
+        ws = _get_or_create_volume_sheet()
+        rows = []
+        for e in exercises:
+            rows.append([
+                date,
+                name,
+                e.get('name', ''),
+                e.get('category', '기타'),
+                e.get('weight', 0),
+                e.get('sets', 0),
+                e.get('reps', 0),
+                e.get('volume', 0),
+            ])
+        if rows:
+            ws.append_rows(rows)
+        return True
+    except Exception as e:
+        logger.error(f"[save_volume_log] {e}")
+        return False
+
+
+def _get_or_create_volume_sheet():
+    """볼륨로그 시트 반환. 없으면 헤더와 함께 생성."""
+    ss = _get_spreadsheet()
+    try:
+        return ss.worksheet("볼륨로그")
+    except Exception:
+        ws = ss.add_worksheet(title="볼륨로그", rows=1000, cols=8)
+        ws.append_row(["날짜", "회원명", "운동명", "부위", "무게(KG)", "세트", "횟수", "총볼륨(KG)"])
+        return ws
+
+
+def get_volume_history(name: str, category: str = None) -> list:
+    """
+    회원 볼륨 히스토리 조회. 시각화용.
+    category: '상체' | '하체' | None (전체)
+    반환: [{'날짜', '운동명', '부위', '무게(KG)', '세트', '횟수', '총볼륨(KG)'}, ...]
+    """
+    try:
+        records = _get_or_create_volume_sheet().get_all_records()
+        result = [r for r in records if str(r.get("회원명", "")).strip() == name.strip()]
+        if category:
+            result = [r for r in result if r.get("부위") == category]
+        return result
+    except Exception as e:
+        logger.error(f"[get_volume_history] {e}")
         return []
 
 
