@@ -20,7 +20,10 @@ from google.oauth2.service_account import Credentials
 
 logger = logging.getLogger(__name__)
 
-SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
+]
 CALENDAR_ID = os.getenv("CALENDAR_ID", "primary")
 # primary = 기본 캘린더. 공유받은 캘린더는 이메일 주소로 설정
 
@@ -94,6 +97,63 @@ def get_recently_ended_classes(window_minutes: int = 10) -> list[dict]:
     except Exception as e:
         logger.error(f"[get_recently_ended_classes] {e}")
         return []
+
+
+def create_class_event(
+    name: str,
+    date_str: str,
+    start_time: str,
+    end_time: str = None,
+    timezone: str = "Asia/Seoul"
+) -> dict | None:
+    """
+    구글 캘린더에 PT 수업 이벤트 생성.
+    Args:
+        name: 회원 이름 (이벤트 제목: "PT {name}")
+        date_str: 날짜 "YYYY-MM-DD"
+        start_time: 시작 시간 "HH:MM"
+        end_time: 종료 시간 "HH:MM" (없으면 시작+1시간)
+    Returns:
+        {'id', 'title', 'start', 'end', 'link'} 또는 None
+    """
+    try:
+        service = _get_calendar_service()
+
+        # 종료 시간 기본값: 시작 + 1시간
+        if not end_time:
+            from datetime import datetime, timedelta
+            start_dt = datetime.strptime(f"{date_str} {start_time}", "%Y-%m-%d %H:%M")
+            end_dt = start_dt + timedelta(hours=1)
+            end_time = end_dt.strftime("%H:%M")
+
+        event = {
+            "summary": f"PT {name}",
+            "start": {
+                "dateTime": f"{date_str}T{start_time}:00",
+                "timeZone": timezone,
+            },
+            "end": {
+                "dateTime": f"{date_str}T{end_time}:00",
+                "timeZone": timezone,
+            },
+        }
+
+        result = service.events().insert(
+            calendarId=CALENDAR_ID,
+            body=event
+        ).execute()
+
+        return {
+            "id": result.get("id"),
+            "title": result.get("summary"),
+            "start": start_time,
+            "end": end_time,
+            "link": result.get("htmlLink", ""),
+        }
+
+    except Exception as e:
+        logger.error(f"[create_class_event] {e}")
+        return None
 
 
 def list_upcoming_classes(days: int = 1) -> list[dict]:
