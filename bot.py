@@ -363,6 +363,69 @@ async def set_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply, parse_mode="Markdown")
 
 
+async def add_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/class 이름 날짜 시작시간 [종료시간] — 구글 캘린더에 수업 등록"""
+    if not is_trainer(update):
+        return
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "사용법: `/class 이름 날짜 시작시간 [종료시간]`\n\n"
+            "예시:\n"
+            "`/class 지현우 2026-04-07 14:00 15:00`\n"
+            "`/class 지현우 2026-04-07 14:00` (종료시간 생략 시 1시간)\n",
+            parse_mode="Markdown"
+        )
+        return
+
+    name       = context.args[0]
+    date_str   = context.args[1]
+    start_time = context.args[2]
+    end_time   = context.args[3] if len(context.args) > 3 else None
+
+    # 날짜 형식 검증
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+        await update.message.reply_text(
+            "❌ 날짜 형식이 잘못됐어요. `YYYY-MM-DD` 형식으로 입력해주세요.\n"
+            "예: `2026-04-07`", parse_mode="Markdown"
+        )
+        return
+
+    # 시간 형식 검증
+    if not re.match(r'^\d{1,2}:\d{2}$', start_time):
+        await update.message.reply_text(
+            "❌ 시간 형식이 잘못됐어요. `HH:MM` 형식으로 입력해주세요.\n"
+            "예: `14:00`", parse_mode="Markdown"
+        )
+        return
+
+    await update.message.reply_text(f"📅 *{name}*님 수업 캘린더 등록 중...", parse_mode="Markdown")
+
+    try:
+        import calendar_check
+        result = calendar_check.create_class_event(name, date_str, start_time, end_time)
+
+        if result:
+            end_display = end_time or result.get('end', '')
+            await update.message.reply_text(
+                f"✅ 캘린더 등록 완료!\n\n"
+                f"👤 회원: *{name}*\n"
+                f"📅 날짜: {date_str}\n"
+                f"⏰ 시간: {start_time} ~ {end_display}\n"
+                f"🔗 [캘린더에서 보기]({result.get('link', '')})",
+                parse_mode="Markdown",
+                disable_web_page_preview=True
+            )
+        else:
+            await update.message.reply_text(
+                "❌ 캘린더 등록에 실패했어요.\n"
+                "캘린더 공유 설정을 확인해주세요."
+            )
+    except ImportError:
+        await update.message.reply_text("❌ 캘린더 모듈을 불러올 수 없어요.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ 오류: {e}")
+
+
 async def update_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/특이사항 이름 내용"""
     if not is_trainer(update):
@@ -592,6 +655,7 @@ def main():
     app.add_handler(CommandHandler("notes", update_notes))
     app.add_handler(CommandHandler("done", class_done_command))
     app.add_handler(CommandHandler("homework", generate_homework_command))
+    app.add_handler(CommandHandler("class", add_class))
 
     # 콜백
     app.add_handler(CallbackQueryHandler(handle_workout_done, pattern="^done_"))
