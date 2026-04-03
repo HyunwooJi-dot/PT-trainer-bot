@@ -198,26 +198,26 @@ def get_recent_homework(name: str, limit: int = 3) -> list[dict]:
 
 def save_volume_log(name: str, date: str, exercises: list) -> bool:
     """
-    운동별 볼륨을 '볼륨로그' 시트에 저장.
+    세션 1개 = 1줄로 볼륨 저장.
     exercises: [{'name', 'weight', 'reps', 'sets', 'volume', 'category'}, ...]
-    컬럼: 날짜 | 회원명 | 운동명 | 부위 | 무게(KG) | 세트 | 횟수 | 총볼륨(KG)
+    컬럼: 날짜 | 회원명 | 상체볼륨(KG) | 하체볼륨(KG) | 기타볼륨(KG) | 전체볼륨(KG) | 운동내용
     """
     try:
         ws = _get_or_create_volume_sheet()
-        rows = []
+
+        upper = sum(e.get('volume', 0) for e in exercises if e.get('category') == '상체')
+        lower = sum(e.get('volume', 0) for e in exercises if e.get('category') == '하체')
+        etc   = sum(e.get('volume', 0) for e in exercises if e.get('category') == '기타')
+        total = upper + lower + etc
+
+        # 운동 내용 요약 텍스트
+        summary_parts = []
         for e in exercises:
-            rows.append([
-                date,
-                name,
-                e.get('name', ''),
-                e.get('category', '기타'),
-                e.get('weight', 0),
-                e.get('sets', 0),
-                e.get('reps', 0),
-                e.get('volume', 0),
-            ])
-        if rows:
-            ws.append_rows(rows)
+            w = f"{e['weight']:g}kg " if e.get('weight') else ""
+            summary_parts.append(f"{e['name']} {w}{e['reps']}x{e['sets']}")
+        summary = ", ".join(summary_parts)
+
+        ws.append_row([date, name, upper, lower, etc, total, summary])
         return True
     except Exception as e:
         logger.error(f"[save_volume_log] {e}")
@@ -230,23 +230,19 @@ def _get_or_create_volume_sheet():
     try:
         return ss.worksheet("볼륨로그")
     except Exception:
-        ws = ss.add_worksheet(title="볼륨로그", rows=1000, cols=8)
-        ws.append_row(["날짜", "회원명", "운동명", "부위", "무게(KG)", "세트", "횟수", "총볼륨(KG)"])
+        ws = ss.add_worksheet(title="볼륨로그", rows=1000, cols=7)
+        ws.append_row(["날짜", "회원명", "상체볼륨(KG)", "하체볼륨(KG)", "기타볼륨(KG)", "전체볼륨(KG)", "운동내용"])
         return ws
 
 
-def get_volume_history(name: str, category: str = None) -> list:
+def get_volume_history(name: str) -> list:
     """
     회원 볼륨 히스토리 조회. 시각화용.
-    category: '상체' | '하체' | None (전체)
-    반환: [{'날짜', '운동명', '부위', '무게(KG)', '세트', '횟수', '총볼륨(KG)'}, ...]
+    반환: [{'날짜', '회원명', '상체볼륨(KG)', '하체볼륨(KG)', '기타볼륨(KG)', '전체볼륨(KG)', '운동내용'}, ...]
     """
     try:
         records = _get_or_create_volume_sheet().get_all_records()
-        result = [r for r in records if str(r.get("회원명", "")).strip() == name.strip()]
-        if category:
-            result = [r for r in result if r.get("부위") == category]
-        return result
+        return [r for r in records if str(r.get("회원명", "")).strip() == name.strip()]
     except Exception as e:
         logger.error(f"[get_volume_history] {e}")
         return []
