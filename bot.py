@@ -434,12 +434,12 @@ def main():
 
     # 핸들러 등록
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("회원등록", register_member))
-    app.add_handler(CommandHandler("회원목록", list_members))
-    app.add_handler(CommandHandler("운동등록", set_workout))
-    app.add_handler(CommandHandler("특이사항", update_notes))
-    app.add_handler(CommandHandler("수업완료", class_done_command))
-    app.add_handler(CommandHandler("숙제생성", generate_homework_command))
+    app.add_handler(CommandHandler("register", register_member))
+    app.add_handler(CommandHandler("members", list_members))
+    app.add_handler(CommandHandler("workout", set_workout))
+    app.add_handler(CommandHandler("notes", update_notes))
+    app.add_handler(CommandHandler("done", class_done_command))
+    app.add_handler(CommandHandler("homework", generate_homework_command))
 
     # 콜백
     app.add_handler(CallbackQueryHandler(handle_workout_done, pattern="^done_"))
