@@ -54,13 +54,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "👋 *PT 트레이너 봇* 시작!\n\n"
             "*트레이너 명령어:*\n"
-            "• `/회원등록 이름 수업요일 특이사항`\n"
-            "• `/회원목록` — 전체 회원 보기\n"
-            "• `/운동등록 이름 날짜 운동내용`\n"
-            "• `/특이사항 이름 내용`\n"
-            "• `/수업완료 이름` — 수업 완료 처리 + 숙제 생성\n"
-            "• `/숙제생성 이름 추가요청(선택)` — 숙제만 생성\n\n"
-            "📅 구글 캘린더 연동 시 수업 종료 10분 전 자동 알림!",
+            "• `/register 이름 수업요일 특이사항` — 회원 등록\n"
+            "• `/members` — 전체 회원 보기\n"
+            "• `/workout 이름 날짜 운동내용` — 운동 등록\n"
+            "• `/notes 이름 내용` — 특이사항 업데이트\n"
+            "• `/done 이름` — 수업 완료 처리 + 숙제 생성\n"
+            "• `/homework 이름 추가요청(선택)` — 숙제만 생성\n\n"
+            "📅 구글 캘린더 연동 시 수업 종료 자동 감지!",
             parse_mode="Markdown"
         )
     else:
