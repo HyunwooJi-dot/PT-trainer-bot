@@ -10,6 +10,7 @@ PT 트레이너 텔레그램 봇 v2
 """
 
 import os
+import re
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -20,6 +21,129 @@ from dotenv import load_dotenv
 from datetime import datetime
 import sheets
 import ai_homework
+
+
+# ─────────────────────────────────────────────
+# 운동 볼륨 파싱
+# ─────────────────────────────────────────────
+
+LOWER_BODY_KEYWORDS = [
+    '스쿼트', '런지', '레그프레스', '레그컬', '레그익스텐션', '데드리프트',
+    '힙쓰러스트', '카프레이즈', '불가리안', '스텝업', '글루트브릿지',
+    '핵스쿼트', 'rdl', 'RDL', '루마니안', '케틀벨스윙', '레그레이즈',
+    '힙어브덕션', '힙어덕션', '클린', '스내치', '박스점프',
+]
+
+UPPER_BODY_KEYWORDS = [
+    '벤치프레스', '벤치', '푸시업', '풀업', '친업', '랫풀다운', '랫풀',
+    '로우', '숄더프레스', '오버헤드프레스', '사이드레터럴', '사이드레이즈',
+    '컬', '바이셉스', '트라이셉스', '딥스', '체스트프레스', '플라이',
+    '페이스풀', '리어델트', '프론트레이즈', '해머컬', '암컬',
+    '시티드로우', '케이블로우', '바벨로우', '덤벨로우', '케이블컬',
+    '숄더', '프레스', '익스텐션',
+]
+
+
+def classify_exercise(name: str) -> str:
+    """운동명을 상체/하체/기타로 분류"""
+    n = name.lower().replace(' ', '')
+    for kw in LOWER_BODY_KEYWORDS:
+        if kw.lower().replace(' ', '') in n:
+            return '하체'
+    for kw in UPPER_BODY_KEYWORDS:
+        if kw.lower().replace(' ', '') in n:
+            return '상체'
+    return '기타'
+
+
+def parse_workout_volume(workout_text: str) -> list:
+    """
+    운동 텍스트에서 각 운동별 볼륨 파싱
+    지원 형식 예시:
+      스쿼트105KG 15X3
+      런지 10KG 덤벨 12X3
+      벤치프레스 60kg 10x4, 오버헤드프레스 40KG 12X3
+    반환: [{'name':str, 'weight':float, 'reps':int, 'sets':int, 'volume':float, 'category':str}, ...]
+    """
+    exercises = []
+
+    # repsXsets 패턴 기준으로 분할 (15X3, 10x4, 12×3 모두 처리)
+    tokens = re.split(r'(\d+\s*[Xx×]\s*\d+)', workout_text)
+
+    for i in range(0, len(tokens) - 1, 2):
+        pre_text = tokens[i].strip().strip(',').strip()
+        rs_str = tokens[i + 1] if i + 1 < len(tokens) else None
+
+        if not pre_text or not rs_str:
+            continue
+
+        # 세트/횟수 파싱
+        rs_match = re.match(r'(\d+)\s*[Xx×]\s*(\d+)', rs_str)
+        if not rs_match:
+            continue
+        reps = int(rs_match.group(1))
+        sets = int(rs_match.group(2))
+
+        # 무게 파싱 (105KG, 10.5kg 등)
+        weight_match = re.search(r'(\d+(?:\.\d+)?)\s*[Kk][Gg]', pre_text)
+        weight = float(weight_match.group(1)) if weight_match else 0.0
+
+        # 운동명 추출 (무게 패턴 제거 후 한글/영문만)
+        name_text = re.sub(r'\d+(?:\.\d+)?\s*[Kk][Gg]', '', pre_text)
+        name_text = re.sub(r'\s+', ' ', name_text).strip().strip(',').strip()
+        name_parts = re.findall(r'[가-힣]+|[A-Za-z]+', name_text)
+        exercise_name = ' '.join(name_parts) if name_parts else name_text
+
+        volume = round(weight * reps * sets, 1)
+        category = classify_exercise(exercise_name)
+
+        exercises.append({
+            'name': exercise_name,
+            'weight': weight,
+            'reps': reps,
+            'sets': sets,
+            'volume': volume,
+            'category': category,
+        })
+
+    return exercises
+
+
+def format_volume_summary(exercises: list) -> str:
+    """볼륨 분석 결과를 텔레그램 메시지로 포맷"""
+    if not exercises:
+        return ""
+
+    lower = [e for e in exercises if e['category'] == '하체']
+    upper = [e for e in exercises if e['category'] == '상체']
+    etc   = [e for e in exercises if e['category'] == '기타']
+
+    lines = ["\n📊 *운동 볼륨 분석*"]
+
+    def fmt_group(icon, label, group):
+        if not group:
+            return
+        lines.append(f"\n{icon} *{label}*")
+        for e in group:
+            vol_str = f"{e['volume']:,.0f}" if e['weight'] > 0 else "—"
+            w_str = f"{e['weight']:g}KG × " if e['weight'] > 0 else ""
+            lines.append(
+                f"  • {e['name']} — {w_str}{e['reps']}회 × {e['sets']}세트"
+                + (f" = *{vol_str}KG*" if e['weight'] > 0 else "")
+            )
+        grp_vol = sum(e['volume'] for e in group)
+        if grp_vol > 0:
+            lines.append(f"  ↳ {label} 소계: *{grp_vol:,.0f} KG*")
+
+    fmt_group("🦵", "하체", lower)
+    fmt_group("💪", "상체", upper)
+    fmt_group("⚡", "기타", etc)
+
+    total = sum(e['volume'] for e in exercises)
+    if total > 0:
+        lines.append(f"\n🔥 *전체 총 볼륨: {total:,.0f} KG*")
+
+    return "\n".join(lines)
 
 load_dotenv()
 logging.basicConfig(
@@ -192,23 +316,33 @@ async def register_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def set_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/운동등록 이름 날짜 운동내용"""
+    """/workout 이름 날짜 운동내용  (볼륨 자동 계산 + 시트 저장)"""
     if not is_trainer(update):
         return
     if len(context.args) < 3:
         await update.message.reply_text(
-            "사용법: `/운동등록 이름 날짜 운동내용`\n"
-            "예: `/운동등록 홍길동 2024-03-15 스쿼트 3x15, 런지 3x12`",
+            "사용법: `/workout 이름 날짜 운동내용`\n"
+            "예: `/workout 홍길동 2024-03-15 스쿼트105KG 15X3 런지 10KG 덤벨 12X3`",
             parse_mode="Markdown"
         )
         return
     name, date = context.args[0], context.args[1]
     workout = " ".join(context.args[2:])
+
+    # 운동 저장
     sheets.save_workout(name, date, workout)
-    await update.message.reply_text(
-        f"✅ *{name}*님 {date} 운동 등록 완료!\n`{workout}`",
-        parse_mode="Markdown"
-    )
+
+    # 볼륨 파싱 & 저장
+    exercises = parse_workout_volume(workout)
+    if exercises:
+        sheets.save_volume_log(name, date, exercises)
+
+    # 응답 메시지
+    reply = f"✅ *{name}*님 {date} 운동 등록 완료!\n`{workout}`"
+    if exercises:
+        reply += format_volume_summary(exercises)
+
+    await update.message.reply_text(reply, parse_mode="Markdown")
 
 
 async def update_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
