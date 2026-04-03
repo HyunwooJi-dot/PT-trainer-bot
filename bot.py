@@ -579,6 +579,36 @@ async def handle_regen_callback(update: Update, context: ContextTypes.DEFAULT_TY
 # 구글 캘린더 연동 (백그라운드 잡)
 # ─────────────────────────────────────────────
 
+async def nightly_homework_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """매일 밤 10시 — 수업 완료했지만 숙제 안 보낸 회원 트레이너에게 알림"""
+    if not TRAINER_CHAT_ID:
+        return
+    try:
+        today = get_today()
+        missing = sheets.get_completed_without_homework(today)
+
+        if not missing:
+            return  # 다 보냈으면 알림 없음
+
+        names = "\n".join(f"• {n}" for n in missing)
+        keyboard = [
+            [InlineKeyboardButton(f"📝 {n}님 숙제 생성", callback_data=f"gen_{n}_밤10시알림")]
+            for n in missing
+        ]
+        await context.bot.send_message(
+            chat_id=TRAINER_CHAT_ID,
+            text=f"🌙 *밤 10시 알림*\n\n"
+                 f"오늘 수업은 완료했지만 숙제를 아직 못 받은 회원이에요:\n\n"
+                 f"{names}\n\n"
+                 f"아래 버튼으로 숙제를 생성해주세요! 👇",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        logger.info(f"[밤10시 알림] 숙제 미발송 {len(missing)}명: {missing}")
+    except Exception as e:
+        logger.error(f"[nightly_homework_reminder] {e}")
+
+
 async def check_calendar_job(context: ContextTypes.DEFAULT_TYPE):
     """
     매 5분마다 실행 — 방금 종료된 수업 이벤트 감지
@@ -667,6 +697,10 @@ def main():
 
     # 캘린더 체크 잡 (5분마다)
     app.job_queue.run_repeating(check_calendar_job, interval=300, first=60)
+
+    # 밤 10시 숙제 미발송 알림 (한국 시간 22:00 = UTC 13:00)
+    from datetime import time as dtime
+    app.job_queue.run_daily(nightly_homework_reminder, time=dtime(hour=13, minute=0))
 
     logger.info("🤖 PT 봇 v2 시작!")
     app.run_polling(drop_pending_updates=True)
