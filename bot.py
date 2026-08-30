@@ -676,6 +676,14 @@ async def salary_daily_sync_job(context: ContextTypes.DEFAULT_TYPE):
     """매일 밤 캘린더 → 급여계산기 세션기록 동기화 + 텔레그램 알림"""
     try:
         result = salary_sync.sync_month()
+
+        # 회원관리 시트도 함께 갱신 (실패해도 급여 동기화는 계속)
+        member_info = None
+        try:
+            member_info = salary_sync.sync_member_list()
+        except Exception as me:
+            logger.error(f"[회원관리 동기화 오류] {me}")
+
         vals = salary_sync.read_dashboard_values()
 
         year_month = result["year_month"]
@@ -708,7 +716,10 @@ async def salary_daily_sync_job(context: ContextTypes.DEFAULT_TYPE):
             for f in failed[:3]:
                 msg += f"  · {f['date']} `{f['title']}`\n"
 
-        msg += f"\n📎 [시트 열기](https://docs.google.com/spreadsheets/d/{salary_sync.SALARY_SPREADSHEET_ID}/edit)"
+        if member_info and member_info.get("members"):
+            msg += f"\n🧑‍💼 회원관리 갱신: *{member_info['members']}명* ({member_info['tab']})"
+
+        msg += f"\n\n📎 [시트 열기](https://docs.google.com/spreadsheets/d/{salary_sync.SALARY_SPREADSHEET_ID}/edit)"
 
         if TRAINER_CHAT_ID:
             await context.bot.send_message(
