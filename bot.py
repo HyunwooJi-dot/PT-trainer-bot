@@ -797,8 +797,8 @@ def main():
     from datetime import time as dtime
     app.job_queue.run_daily(nightly_homework_reminder, time=dtime(hour=13, minute=0))
 
-    # 💰 급여 자동 동기화 (한국 시간 23:00 = UTC 14:00)
-    app.job_queue.run_daily(salary_daily_sync_job, time=dtime(hour=14, minute=0))
+    # 💰 급여 자동 동기화 (한국 시간 22:00 = UTC 13:00, nightly와 5분 차이)
+    app.job_queue.run_daily(salary_daily_sync_job, time=dtime(hour=13, minute=5))
 
     # 📚 급여 월별 아카이브 (한국 일요일 03:00 = UTC 토요일 18:00)
     app.job_queue.run_daily(
