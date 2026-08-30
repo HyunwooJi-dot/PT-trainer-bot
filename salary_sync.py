@@ -353,49 +353,30 @@ def archive_month(year: int = None, month: int = None) -> dict:
 
 
 # ---------- 회원관리 시트 동기화 ----------
-def _get_current_month_tab_name(now=None):
+def _get_month_tab_name(offset=0, now=None):
+    """이번 달 기준 offset 만큼 이전/이후 월의 탭 이름 반환. offset=-1이면 지난 달."""
     if now is None:
         now = datetime.now(timezone(timedelta(hours=9)))
-    yy = now.year % 100
-    return f"{yy}년{now.month}월"
+    year, month = now.year, now.month + offset
+    while month <= 0:
+        month += 12
+        year -= 1
+    while month > 12:
+        month -= 12
+        year += 1
+    return f"{year % 100}년{month}월"
 
 
-def sync_member_list() -> dict:
-    """
-    답십리점 오티 관리표 → 급여계산기 '회원관리 및 특이사항' 탭 동기화
-    - 이번 달 탭 자동 감지 (없으면 최신 월 탭 사용)
-    - 담당PT = TRAINER_FULLNAME 인 행만 필터
-    - 대상 시트에 덮어쓰기 (기존 데이터 지우고 새로 입력)
-    """
-    logger.info("[회원관리] 동기화 시작")
-
-    creds = _get_credentials()
-    gc = gspread.authorize(creds)
-    service = build("sheets", "v4", credentials=creds)
-
-    # 1. 소스 시트 - 이번 달 탭
-    source_sh = gc.open_by_key(SOURCE_MEMBER_SHEET_ID)
-    tab_name = _get_current_month_tab_name()
+def _fetch_month_data(source_sh, tab_name):
+    """특정 월 탭에서 담당PT 필터링된 데이터 반환. (header, filtered_rows)"""
     try:
         source_ws = source_sh.worksheet(tab_name)
     except gspread.WorksheetNotFound:
-        # 최신 월 탭 자동 감지
-        year_month_re = re.compile(r"^(\d{2})년(\d{1,2})월$")
-        candidates = []
-        for ws in source_sh.worksheets():
-            m = year_month_re.match(ws.title)
-            if m:
-                candidates.append((int(m.group(1)), int(m.group(2)), ws))
-        candidates.sort(reverse=True)
-        if not candidates:
-            logger.warning("[회원관리] 월 형식 탭을 찾을 수 없음")
-            return {"members": 0, "tab": None, "error": "no_month_tab"}
-        source_ws = candidates[0][2]
-        tab_name = source_ws.title
+        return None, []
 
     all_rows = source_ws.get("A1:M1000")
     if not all_rows:
-        return {"members": 0, "tab": tab_name, "error": "empty"}
+        return None, []
 
     header = all_rows[0]
     data_rows = all_rows[1:]
@@ -409,10 +390,42 @@ def sync_member_list() -> dict:
         row for row in data_rows
         if len(row) > trainer_col and row[trainer_col].strip() == TRAINER_FULLNAME
     ]
-    logger.info(f"[회원관리] {tab_name}: 전체 {len(data_rows)}행 → 담당 {len(filtered)}행")
+    return header, filtered
 
-    # 2. 대상 탭 준비
+
+def sync_member_list(months=(0, -1)) -> dict:
+    """
+    답십리점 오티 관리표 → 급여계산기 '회원관리 및 특이사항' 탭 동기화
+    - months: 오프셋 튜플 (기본: 이번 달 + 지난 달)
+    - 각 월별로 섹션 나눠서 표시
+    """
+    logger.info(f"[회원관리] 동기화 시작 (months offset={months})")
+
+    creds = _get_credentials()
+    gc = gspread.authorize(creds)
+    service = build("sheets", "v4", credentials=creds)
+
+    source_sh = gc.open_by_key(SOURCE_MEMBER_SHEET_ID)
     target_sh = gc.open_by_key(SALARY_SPREADSHEET_ID)
+
+    # 각 월 데이터 수집
+    header = None
+    monthly_data = []  # [(tab_name, filtered_rows), ...]
+    total_members = 0
+    for offset in months:
+        tab_name = _get_month_tab_name(offset)
+        h, filtered = _fetch_month_data(source_sh, tab_name)
+        if h is not None:
+            if header is None:
+                header = h
+            monthly_data.append((tab_name, filtered))
+            total_members += len(filtered)
+            logger.info(f"[회원관리] {tab_name}: {len(filtered)}명")
+
+    if not monthly_data or header is None:
+        return {"members": 0, "tab": None, "error": "no_data"}
+
+    # 대상 탭 준비
     try:
         target_ws = target_sh.worksheet(MEMBER_TARGET_SHEET_NAME)
         target_ws.clear()
@@ -422,7 +435,7 @@ def sync_member_list() -> dict:
         settings_ws = target_sh.worksheet("⚙️설정")
         req = {"addSheet": {"properties": {
             "title": MEMBER_TARGET_SHEET_NAME,
-            "gridProperties": {"rowCount": max(len(filtered) + 10, 50), "columnCount": len(header)},
+            "gridProperties": {"rowCount": max(total_members + 20, 50), "columnCount": len(header)},
             "index": settings_ws.index,
         }}}
         res = service.spreadsheets().batchUpdate(
@@ -433,13 +446,34 @@ def sync_member_list() -> dict:
         target_ws = target_sh.worksheet(MEMBER_TARGET_SHEET_NAME)
         is_new = True
 
-    # 3. 데이터 입력
+    # 데이터 조립 (여러 월 섹션)
     now_kr = datetime.now(timezone(timedelta(hours=9)))
-    title_row = [f"🧑‍💼 회원관리 및 특이사항 ({tab_name})"]
-    info_row = [f"💡 담당PT='{TRAINER_FULLNAME}' 자동 필터  ·  마지막 갱신: {now_kr.strftime('%Y-%m-%d %H:%M')}"]
-    all_values = [title_row, info_row, header] + filtered
-
     max_cols = len(header)
+    tabs_label = " + ".join(t for t, _ in monthly_data)
+
+    all_values = [
+        [f"🧑‍💼 회원관리 및 특이사항 ({tabs_label})"],
+        [f"💡 담당PT='{TRAINER_FULLNAME}' 자동 필터  ·  마지막 갱신: {now_kr.strftime('%Y-%m-%d %H:%M')}"],
+    ]
+
+    section_rows = []  # 섹션 헤더가 있는 행 번호 (서식용)
+    for tab_name, filtered in monthly_data:
+        # 섹션 헤더 (월 표시)
+        section_header_row = len(all_values) + 1  # 1-indexed
+        all_values.append([f"📅 {tab_name} ({len(filtered)}명)"])
+        section_rows.append(section_header_row)
+        # 컬럼 헤더
+        all_values.append(header)
+        # 데이터
+        all_values.extend(filtered)
+        # 빈 행 (섹션 구분)
+        all_values.append([""])
+
+    # 마지막 빈 행 제거
+    if all_values and all_values[-1] == [""]:
+        all_values.pop()
+
+    # 셀 개수 맞추기
     padded = [(row + [""] * (max_cols - len(row))) if len(row) < max_cols else row
               for row in all_values]
 
@@ -450,24 +484,29 @@ def sync_member_list() -> dict:
         value_input_option="USER_ENTERED",
     )
 
-    # 신규 생성 시에만 서식 적용
-    if is_new:
-        _apply_member_sheet_formatting(service, sheet_id, max_cols, len(padded))
+    # 서식 적용 (매번 - 섹션 구조가 바뀔 수 있으므로)
+    _apply_member_sheet_formatting(
+        service, sheet_id, max_cols, len(padded),
+        section_rows=section_rows,
+    )
 
     return {
-        "members": len(filtered),
-        "tab": tab_name,
-        "total_rows": len(data_rows),
+        "members": total_members,
+        "tab": tabs_label,
+        "months": len(monthly_data),
     }
 
 
-def _apply_member_sheet_formatting(service, sheet_id, max_cols, last_row):
-    """회원관리 시트 서식 (최초 생성 시에만)"""
+def _apply_member_sheet_formatting(service, sheet_id, max_cols, last_row, section_rows=None):
+    """회원관리 시트 서식. section_rows: 섹션 헤더 (월 표시) 행 번호 리스트"""
+    section_rows = section_rows or []
+
     def rgb(h):
         h = h.lstrip("#")
         return {"red": int(h[0:2], 16)/255, "green": int(h[2:4], 16)/255, "blue": int(h[4:6], 16)/255}
 
     C_HEADER = rgb("2E5C8A")
+    C_SECTION = rgb("F4B942")   # 골드 (섹션 헤더)
     C_WHITE = rgb("FFFFFF")
     C_GRAY = rgb("666666")
     C_MUTED = rgb("F5F5F5")
@@ -504,15 +543,29 @@ def _apply_member_sheet_formatting(service, sheet_id, max_cols, last_row):
     lc = chr(ord("A") + max_cols - 1)
     reqs = [
         {"updateSheetProperties": {"properties": {"sheetId": sheet_id, "gridProperties": {"hideGridlines": True}}, "fields": "gridProperties.hideGridlines"}},
+        # 상단 제목 (1-2행)
         freq(f"A1:{lc}1", fmt(bold=True, size=16, color=C_HEADER, halign="CENTER")),
         {"mergeCells": {"range": grid(f"A1:{lc}1"), "mergeType": "MERGE_ALL"}},
         freq(f"A2:{lc}2", fmt(italic=True, color=C_GRAY, size=9, halign="CENTER")),
         {"mergeCells": {"range": grid(f"A2:{lc}2"), "mergeType": "MERGE_ALL"}},
-        freq(f"A3:{lc}3", fmt(bg=C_HEADER, bold=True, color=C_WHITE, halign="CENTER")),
-        freq(f"A4:{lc}{last_row}", fmt(halign="LEFT", size=9, wrap=True)),
-        {"updateSheetProperties": {"properties": {"sheetId": sheet_id, "gridProperties": {"frozenRowCount": 3}}, "fields": "gridProperties.frozenRowCount"}},
+        # 전체 데이터 영역 기본 서식
+        freq(f"A3:{lc}{last_row}", fmt(halign="LEFT", size=9, wrap=True)),
+        # 2행 고정
+        {"updateSheetProperties": {"properties": {"sheetId": sheet_id, "gridProperties": {"frozenRowCount": 2}}, "fields": "gridProperties.frozenRowCount"}},
     ]
 
+    # 섹션별 서식 (섹션헤더 → 다음 행 = 컬럼헤더)
+    for sec_row in section_rows:
+        # 섹션 헤더 (골드 배경)
+        reqs.append(freq(f"A{sec_row}:{lc}{sec_row}",
+                         fmt(bg=C_SECTION, bold=True, size=12, halign="LEFT")))
+        reqs.append({"mergeCells": {"range": grid(f"A{sec_row}:{lc}{sec_row}"), "mergeType": "MERGE_ALL"}})
+        # 컬럼 헤더 (섹션 헤더 바로 다음 행)
+        col_header_row = sec_row + 1
+        reqs.append(freq(f"A{col_header_row}:{lc}{col_header_row}",
+                         fmt(bg=C_HEADER, bold=True, color=C_WHITE, halign="CENTER", size=10)))
+
+    # 열 너비
     widths = [90, 70, 400, 100, 110, 70, 60, 60, 90, 90, 120, 100, 80]
     for i, w in enumerate(widths[:max_cols]):
         reqs.append({"updateDimensionProperties": {
@@ -520,9 +573,14 @@ def _apply_member_sheet_formatting(service, sheet_id, max_cols, last_row):
             "properties": {"pixelSize": w}, "fields": "pixelSize",
         }})
 
+    # 행 높이 - 데이터 행만 (특이사항 wrap 위한 여유)
     reqs.append({"updateDimensionProperties": {
-        "range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": 3, "endIndex": last_row},
+        "range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": 2, "endIndex": last_row},
         "properties": {"pixelSize": 60}, "fields": "pixelSize",
+    }})
+    reqs.append({"updateDimensionProperties": {
+        "range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": 0, "endIndex": 1},
+        "properties": {"pixelSize": 40}, "fields": "pixelSize",
     }})
 
     for i in range(0, len(reqs), 100):
