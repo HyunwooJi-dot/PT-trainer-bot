@@ -149,10 +149,38 @@ def parse_event(event: dict) -> dict | None:
 
 
 # ---------- 메인 동기화 함수 ----------
+PACKAGE_REVENUE_PER_SESSION = 20000  # 패키지 2~5회차 세션당 매출
+
+
+def classify_session(session: dict) -> str:
+    """세션 종류 판정: 'OT' | '패키지' | '개인'"""
+    if session.get("is_ot"):
+        return "OT"
+    total = session.get("total_sessions", 0)
+    if total == 5:
+        return "패키지"
+    return "개인"
+
+
+def calc_session_revenue(session: dict, member_info: dict | None) -> int:
+    """세션 매출 계산. member_info는 회원명부에서 조회한 매출대상 회원의 정보."""
+    kind = classify_session(session)
+    if kind == "OT":
+        return 0
+    if kind == "패키지":
+        # 진행회차 1이면 회사가 가져감 (매출 0), 그 외 회당 2만원
+        if session.get("progress", 1) == 1:
+            return 0
+        return PACKAGE_REVENUE_PER_SESSION
+    # 개인 PT: 회원명부의 개인회당단가 참조
+    if member_info is None:
+        return 0
+    return int(member_info.get("개인회당단가", 0) or 0)
+
+
 def sync_month(year: int = None, month: int = None) -> dict:
     """
-    지정 월(기본 이번 달) 캘린더 이벤트 → 세션기록 시트 동기화
-    반환: {'sessions': N, 'ot': N, 'new_members': [...], 'failed': [...]}
+    지정 월 캘린더 → 세션기록 시트 동기화 (매출까지 자동 계산)
     """
     if year is None or month is None:
         now = datetime.now(timezone(timedelta(hours=9)))
@@ -161,7 +189,6 @@ def sync_month(year: int = None, month: int = None) -> dict:
     logger.info(f"[급여] {year}-{month:02d} 동기화 시작")
 
     events = fetch_events(year, month)
-    logger.info(f"[급여] 캘린더 이벤트 {len(events)}개 조회")
 
     parsed_sessions = []
     ot_sessions = []
@@ -169,9 +196,7 @@ def sync_month(year: int = None, month: int = None) -> dict:
 
     for e in events:
         result = parse_event(e)
-        if result is None:
-            continue
-        if result.get("skip"):
+        if result is None or result.get("skip"):
             continue
         if result.get("parse_failed"):
             failed.append(result)
@@ -181,34 +206,56 @@ def sync_month(year: int = None, month: int = None) -> dict:
             continue
         parsed_sessions.append(result)
 
-    # ---- 시트 접근 ----
+    # ---- 시트 ----
     creds = _get_credentials()
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(SALARY_SPREADSHEET_ID)
 
-    # ---- 회원명부 확인 & 신규 자동등록 ----
+    # ---- 회원명부 조회 (새 구조) ----
+    # A: 회원명, B: 패키지등록, C: 패키지매출, D: 개인회차, E: 개인총금액,
+    # F: 개인회당단가(자동), G: 구분, H: 공유회원, I: 메모
     member_ws = sh.worksheet("👥회원명부")
     member_data = member_ws.get_all_values()
 
-    existing_members = {}
+    existing_members = {}  # name -> {row, 패키지등록, 개인회차, 공유회원, 개인회당단가}
     last_row = 4
     for i, row in enumerate(member_data[4:], start=5):
         if len(row) > 0 and row[0].strip():
-            existing_members[row[0].strip()] = i
+            name = row[0].strip()
+            # 값 파싱
+            def to_num(s):
+                if not s: return 0
+                s = str(s).replace(",", "").replace("원", "").replace("회", "").strip()
+                try: return float(s)
+                except: return 0
+            existing_members[name] = {
+                "row": i,
+                "패키지등록": int(to_num(row[1]) if len(row) > 1 else 0),
+                "개인회차":   int(to_num(row[3]) if len(row) > 3 else 0),
+                "개인회당단가": to_num(row[5]) if len(row) > 5 else 0,
+                "공유회원":   (row[7].strip() if len(row) > 7 else "") or None,
+            }
             last_row = i
 
+    # ---- 신규 회원 자동등록 (새 구조) ----
+    # unknown_members: name -> {패키지등록: 0 or 5, 개인회차: X or 0, reg_type}
     unknown_members = {}
     for s in parsed_sessions:
         if s["name"] not in existing_members:
             cur = unknown_members.get(s["name"], {
-                "total_sessions": 0, "reg_type": s["reg_type"],
-                "is_oneshot": s.get("is_oneshot", False),
+                "패키지등록": 0, "개인회차": 0, "reg_type": s["reg_type"],
             })
-            if s["total_sessions"] > cur["total_sessions"]:
-                cur["total_sessions"] = s["total_sessions"]
-                cur["reg_type"] = s["reg_type"]
-            if s.get("is_oneshot"):
-                cur["is_oneshot"] = True
+            total = s.get("total_sessions", 0)
+            extra = s.get("extra_sessions", 0)
+            if total == 5:
+                cur["패키지등록"] = 5
+                if extra > 0:
+                    # 5+X 혼합
+                    cur["개인회차"] = max(cur["개인회차"], extra)
+            elif total > 0:
+                # 개인 등록만
+                cur["개인회차"] = max(cur["개인회차"], total)
+            cur["reg_type"] = s["reg_type"]
             unknown_members[s["name"]] = cur
 
     ot_only_members = set()
@@ -219,46 +266,102 @@ def sync_month(year: int = None, month: int = None) -> dict:
     if unknown_members or ot_only_members:
         new_rows = []
         for name, info in unknown_members.items():
-            memo = "🤖 캘린더 자동등록 - 총금액 입력 필요"
-            if info.get("is_oneshot"):
-                memo = "🤖 1회성 손님 - 1회당 금액 입력"
+            has_pkg = info["패키지등록"] == 5
+            has_prv = info["개인회차"] > 0
+            if has_pkg and has_prv:
+                memo = "🤖 5+X 혼합 - 개인총금액 입력 필요"
+            elif has_pkg:
+                memo = "🤖 패키지 신규 (자동)"
+            elif has_prv:
+                memo = "🤖 개인PT - 총금액 입력 필요"
+            else:
+                memo = "🤖 자동등록"
+
             new_rows.append([
-                name, info["total_sessions"], "", "", "",
-                info["reg_type"], memo,
+                name,
+                info["패키지등록"] if has_pkg else 0,
+                80000 if has_pkg else 0,
+                info["개인회차"] if has_prv else 0,
+                "",  # 개인총금액 (사용자 입력)
+                "",  # F: 개인회당단가 (수식으로 자동)
+                info["reg_type"],
+                "",  # 공유회원 (수동)
+                memo,
             ])
         for name in ot_only_members:
             new_rows.append([
-                name, "", "", "", "", "신규", "🤖 OT만 있음",
+                name, 0, 0, 0, "", "", "신규", "", "🤖 OT만 있음"
             ])
 
         start_new_row = last_row + 1
         for i, row in enumerate(new_rows):
             r_idx = start_new_row + i
-            row[3] = f'=IFERROR(IF(B{r_idx}="","",C{r_idx}/B{r_idx}),"")'
-            row[4] = f'=IF(B{r_idx}="","",IF(B{r_idx}=5,"패키지","개인"))'
+            row[5] = f'=IFERROR(IF(OR(D{r_idx}="",D{r_idx}=0),"",E{r_idx}/D{r_idx}),"")'
 
         member_ws.update(
-            range_name=f"A{start_new_row}:G{start_new_row + len(new_rows) - 1}",
+            range_name=f"A{start_new_row}:I{start_new_row + len(new_rows) - 1}",
             values=new_rows,
             value_input_option="USER_ENTERED",
         )
+        # 신규 등록된 회원도 existing_members에 즉시 반영 (매출 계산용)
+        for name, info in unknown_members.items():
+            existing_members[name] = {
+                "row": None,
+                "패키지등록": info["패키지등록"],
+                "개인회차": info["개인회차"],
+                "개인회당단가": 0,  # 사용자 입력 대기
+                "공유회원": None,
+            }
 
-    # ---- 세션기록 업데이트 ----
+    # ---- 세션기록 생성 (매출 계산) ----
     session_ws = sh.worksheet("📝세션기록")
-    session_ws.batch_clear(["A5:C304"])
+    session_ws.batch_clear(["A5:G304"])
 
+    all_sessions = sorted(parsed_sessions + ot_sessions, key=lambda x: (x["date"], x["time"]))
     session_rows = []
-    for s in sorted(parsed_sessions + ot_sessions, key=lambda x: (x["date"], x["time"])):
-        session_rows.append([s["date"], s["time"], s["name"]])
+    for s in all_sessions:
+        name = s["name"]
+        # 매출대상 결정 (공유회원이면 대표 회원)
+        member_info = existing_members.get(name)
+        target_name = name
+        if member_info and member_info.get("공유회원"):
+            target_name = member_info["공유회원"]
+            target_info = existing_members.get(target_name)
+            if target_info:
+                member_info = target_info
 
+        kind = classify_session(s)
+        revenue = calc_session_revenue(s, member_info)
+
+        # 진행회차 표기
+        if s.get("is_ot"):
+            progress_str = "OT"
+        else:
+            total = s.get("total_sessions", 0)
+            extra = s.get("extra_sessions", 0)
+            progress = s.get("progress", 0)
+            if extra > 0:
+                progress_str = f"{total}+{extra}/{progress}"
+            else:
+                progress_str = f"{total}/{progress}"
+
+        session_rows.append([
+            s["date"], s["time"], name,
+            target_name, kind, progress_str, revenue
+        ])
+
+    # 300행까지 빈값
     while len(session_rows) < 300:
-        session_rows.append(["", "", ""])
+        session_rows.append(["", "", "", "", "", "", ""])
 
     session_ws.update(
-        range_name=f"A5:C{5 + len(session_rows) - 1}",
+        range_name=f"A5:G{5 + len(session_rows) - 1}",
         values=session_rows,
         value_input_option="USER_ENTERED",
     )
+
+    # 매출 총합 계산 (알림용)
+    total_revenue = sum(r[6] for r in session_rows if isinstance(r[6], (int, float)))
 
     result = {
         "year_month": f"{year}-{month:02d}",
@@ -266,6 +369,7 @@ def sync_month(year: int = None, month: int = None) -> dict:
         "ot": len(ot_sessions),
         "new_members": list(unknown_members.keys()) + list(ot_only_members),
         "failed": failed,
+        "total_revenue": int(total_revenue),
     }
     logger.info(f"[급여] 동기화 완료: {result}")
     return result
