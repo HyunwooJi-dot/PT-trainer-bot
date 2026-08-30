@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 from datetime import datetime
 import sheets
 import ai_homework
+import salary_sync
 
 
 # ─────────────────────────────────────────────
@@ -668,6 +669,89 @@ async def check_calendar_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
+# 급여 계산기 자동 동기화
+# ─────────────────────────────────────────────
+
+async def salary_daily_sync_job(context: ContextTypes.DEFAULT_TYPE):
+    """매일 밤 캘린더 → 급여계산기 세션기록 동기화 + 텔레그램 알림"""
+    try:
+        result = salary_sync.sync_month()
+        vals = salary_sync.read_dashboard_values()
+
+        year_month = result["year_month"]
+        sessions = result["sessions"]
+        ot = result["ot"]
+        new_members = result["new_members"]
+        failed = result["failed"]
+
+        msg = (
+            f"💰 *급여 자동 동기화 완료* ({year_month})\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"✅ 정상 세션: *{sessions}개* (OT {ot}개)\n"
+        )
+        if new_members:
+            msg += f"🆕 신규 회원 자동등록: *{len(new_members)}명*\n"
+            for name in new_members[:5]:
+                msg += f"  · {name}\n"
+            if len(new_members) > 5:
+                msg += f"  · ...외 {len(new_members) - 5}명\n"
+
+        msg += (
+            f"\n💵 *이번 달 예상*\n"
+            f"  총매출:    `{vals['총매출']:>12,.0f}원`\n"
+            f"  총지급액:  `{vals['총지급액']:>12,.0f}원`\n"
+            f"  실수령액:  `{vals['실수령액']:>12,.0f}원`\n"
+        )
+
+        if failed:
+            msg += f"\n⚠️ 파싱 실패 {len(failed)}개 (캘린더 제목 확인 필요)\n"
+            for f in failed[:3]:
+                msg += f"  · {f['date']} `{f['title']}`\n"
+
+        msg += f"\n📎 [시트 열기](https://docs.google.com/spreadsheets/d/{salary_sync.SALARY_SPREADSHEET_ID}/edit)"
+
+        if TRAINER_CHAT_ID:
+            await context.bot.send_message(
+                chat_id=TRAINER_CHAT_ID,
+                text=msg,
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
+    except Exception as e:
+        logger.error(f"[급여 동기화 오류] {e}")
+        if TRAINER_CHAT_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=TRAINER_CHAT_ID,
+                    text=f"⚠️ 급여 동기화 실패\n`{str(e)[:200]}`",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+
+
+async def salary_weekly_archive_job(context: ContextTypes.DEFAULT_TYPE):
+    """매주 일요일 새벽 이번 달 급여 데이터를 월별기록 시트에 저장"""
+    try:
+        result = salary_sync.archive_month()
+        msg = (
+            f"📚 *월별 급여 자동 아카이브* ({result['year_month']})\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"총매출:   `{result['총매출']:>12,.0f}원`\n"
+            f"실수령액: `{result['실수령액']:>12,.0f}원`\n\n"
+            f"월별기록 시트에 저장됨"
+        )
+        if TRAINER_CHAT_ID:
+            await context.bot.send_message(
+                chat_id=TRAINER_CHAT_ID,
+                text=msg,
+                parse_mode="Markdown",
+            )
+    except Exception as e:
+        logger.error(f"[급여 아카이브 오류] {e}")
+
+
+# ─────────────────────────────────────────────
 # 앱 실행
 # ─────────────────────────────────────────────
 
@@ -701,6 +785,16 @@ def main():
     # 밤 10시 숙제 미발송 알림 (한국 시간 22:00 = UTC 13:00)
     from datetime import time as dtime
     app.job_queue.run_daily(nightly_homework_reminder, time=dtime(hour=13, minute=0))
+
+    # 💰 급여 자동 동기화 (한국 시간 23:00 = UTC 14:00)
+    app.job_queue.run_daily(salary_daily_sync_job, time=dtime(hour=14, minute=0))
+
+    # 📚 급여 월별 아카이브 (한국 일요일 03:00 = UTC 토요일 18:00)
+    app.job_queue.run_daily(
+        salary_weekly_archive_job,
+        time=dtime(hour=18, minute=0),
+        days=(5,),  # 5 = 토요일 UTC (한국 일요일 새벽)
+    )
 
     logger.info("🤖 PT 봇 v2 시작!")
     app.run_polling(drop_pending_updates=True)
