@@ -15,6 +15,7 @@
 
 import os
 import re
+import time
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -28,6 +29,11 @@ logger = logging.getLogger(__name__)
 SALARY_SPREADSHEET_ID = os.getenv("SALARY_SPREADSHEET_ID", "1Xg9BgIKb0nA3ahz2Jn2c9hKOU80ta3Ki_KXX544_au8")
 CALENDAR_ID = os.getenv("CALENDAR_ID", "jhw1390@gmail.com")
 TRAINER_NAME = os.getenv("TRAINER_NAME", "현우")
+
+# 회원관리 시트 (답십리점 오티 관리표)
+SOURCE_MEMBER_SHEET_ID = os.getenv("SOURCE_MEMBER_SHEET_ID", "1IN4z0J7V0rXSJdONItieQqinvtTBU_f8CDs1xsB2Ito")
+TRAINER_FULLNAME = os.getenv("TRAINER_FULLNAME", "지현우")
+MEMBER_TARGET_SHEET_NAME = "🧑‍💼회원관리 및 특이사항"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -344,3 +350,182 @@ def archive_month(year: int = None, month: int = None) -> dict:
 
     logger.info(f"[급여] 아카이브 완료: {year_month} 실수령 {vals['실수령액']:,.0f}원")
     return {**vals, "year_month": year_month}
+
+
+# ---------- 회원관리 시트 동기화 ----------
+def _get_current_month_tab_name(now=None):
+    if now is None:
+        now = datetime.now(timezone(timedelta(hours=9)))
+    yy = now.year % 100
+    return f"{yy}년{now.month}월"
+
+
+def sync_member_list() -> dict:
+    """
+    답십리점 오티 관리표 → 급여계산기 '회원관리 및 특이사항' 탭 동기화
+    - 이번 달 탭 자동 감지 (없으면 최신 월 탭 사용)
+    - 담당PT = TRAINER_FULLNAME 인 행만 필터
+    - 대상 시트에 덮어쓰기 (기존 데이터 지우고 새로 입력)
+    """
+    logger.info("[회원관리] 동기화 시작")
+
+    creds = _get_credentials()
+    gc = gspread.authorize(creds)
+    service = build("sheets", "v4", credentials=creds)
+
+    # 1. 소스 시트 - 이번 달 탭
+    source_sh = gc.open_by_key(SOURCE_MEMBER_SHEET_ID)
+    tab_name = _get_current_month_tab_name()
+    try:
+        source_ws = source_sh.worksheet(tab_name)
+    except gspread.WorksheetNotFound:
+        # 최신 월 탭 자동 감지
+        year_month_re = re.compile(r"^(\d{2})년(\d{1,2})월$")
+        candidates = []
+        for ws in source_sh.worksheets():
+            m = year_month_re.match(ws.title)
+            if m:
+                candidates.append((int(m.group(1)), int(m.group(2)), ws))
+        candidates.sort(reverse=True)
+        if not candidates:
+            logger.warning("[회원관리] 월 형식 탭을 찾을 수 없음")
+            return {"members": 0, "tab": None, "error": "no_month_tab"}
+        source_ws = candidates[0][2]
+        tab_name = source_ws.title
+
+    all_rows = source_ws.get("A1:M1000")
+    if not all_rows:
+        return {"members": 0, "tab": tab_name, "error": "empty"}
+
+    header = all_rows[0]
+    data_rows = all_rows[1:]
+
+    try:
+        trainer_col = header.index("담당PT")
+    except ValueError:
+        trainer_col = 5
+
+    filtered = [
+        row for row in data_rows
+        if len(row) > trainer_col and row[trainer_col].strip() == TRAINER_FULLNAME
+    ]
+    logger.info(f"[회원관리] {tab_name}: 전체 {len(data_rows)}행 → 담당 {len(filtered)}행")
+
+    # 2. 대상 탭 준비
+    target_sh = gc.open_by_key(SALARY_SPREADSHEET_ID)
+    try:
+        target_ws = target_sh.worksheet(MEMBER_TARGET_SHEET_NAME)
+        target_ws.clear()
+        sheet_id = target_ws.id
+        is_new = False
+    except gspread.WorksheetNotFound:
+        settings_ws = target_sh.worksheet("⚙️설정")
+        req = {"addSheet": {"properties": {
+            "title": MEMBER_TARGET_SHEET_NAME,
+            "gridProperties": {"rowCount": max(len(filtered) + 10, 50), "columnCount": len(header)},
+            "index": settings_ws.index,
+        }}}
+        res = service.spreadsheets().batchUpdate(
+            spreadsheetId=SALARY_SPREADSHEET_ID,
+            body={"requests": [req]},
+        ).execute()
+        sheet_id = res["replies"][0]["addSheet"]["properties"]["sheetId"]
+        target_ws = target_sh.worksheet(MEMBER_TARGET_SHEET_NAME)
+        is_new = True
+
+    # 3. 데이터 입력
+    now_kr = datetime.now(timezone(timedelta(hours=9)))
+    title_row = [f"🧑‍💼 회원관리 및 특이사항 ({tab_name})"]
+    info_row = [f"💡 담당PT='{TRAINER_FULLNAME}' 자동 필터  ·  마지막 갱신: {now_kr.strftime('%Y-%m-%d %H:%M')}"]
+    all_values = [title_row, info_row, header] + filtered
+
+    max_cols = len(header)
+    padded = [(row + [""] * (max_cols - len(row))) if len(row) < max_cols else row
+              for row in all_values]
+
+    last_col_letter = chr(ord("A") + max_cols - 1)
+    target_ws.update(
+        range_name=f"A1:{last_col_letter}{len(padded)}",
+        values=padded,
+        value_input_option="USER_ENTERED",
+    )
+
+    # 신규 생성 시에만 서식 적용
+    if is_new:
+        _apply_member_sheet_formatting(service, sheet_id, max_cols, len(padded))
+
+    return {
+        "members": len(filtered),
+        "tab": tab_name,
+        "total_rows": len(data_rows),
+    }
+
+
+def _apply_member_sheet_formatting(service, sheet_id, max_cols, last_row):
+    """회원관리 시트 서식 (최초 생성 시에만)"""
+    def rgb(h):
+        h = h.lstrip("#")
+        return {"red": int(h[0:2], 16)/255, "green": int(h[2:4], 16)/255, "blue": int(h[4:6], 16)/255}
+
+    C_HEADER = rgb("2E5C8A")
+    C_WHITE = rgb("FFFFFF")
+    C_GRAY = rgb("666666")
+    C_MUTED = rgb("F5F5F5")
+
+    def fmt(**kw):
+        f = {}
+        if "bg" in kw: f["backgroundColor"] = kw["bg"]
+        tf = {"fontFamily": "맑은 고딕", "fontSize": kw.get("size", 10)}
+        if kw.get("bold"): tf["bold"] = True
+        if kw.get("italic"): tf["italic"] = True
+        if kw.get("color"): tf["foregroundColor"] = kw["color"]
+        f["textFormat"] = tf
+        f["horizontalAlignment"] = kw.get("halign", "LEFT")
+        f["verticalAlignment"] = "MIDDLE"
+        if kw.get("wrap"):
+            f["wrapStrategy"] = "WRAP"
+        return f
+
+    def grid(a1):
+        m = re.match(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", a1)
+        c1, r1, c2, r2 = m.groups()
+        def col(c):
+            n = 0
+            for ch in c: n = n*26 + ord(ch) - ord("A") + 1
+            return n
+        return {"sheetId": sheet_id,
+                "startRowIndex": int(r1)-1, "endRowIndex": int(r2),
+                "startColumnIndex": col(c1)-1, "endColumnIndex": col(c2)}
+
+    def freq(a1, f):
+        fields = ",".join(f"userEnteredFormat.{k}" for k in f.keys())
+        return {"repeatCell": {"range": grid(a1), "cell": {"userEnteredFormat": f}, "fields": fields}}
+
+    lc = chr(ord("A") + max_cols - 1)
+    reqs = [
+        {"updateSheetProperties": {"properties": {"sheetId": sheet_id, "gridProperties": {"hideGridlines": True}}, "fields": "gridProperties.hideGridlines"}},
+        freq(f"A1:{lc}1", fmt(bold=True, size=16, color=C_HEADER, halign="CENTER")),
+        {"mergeCells": {"range": grid(f"A1:{lc}1"), "mergeType": "MERGE_ALL"}},
+        freq(f"A2:{lc}2", fmt(italic=True, color=C_GRAY, size=9, halign="CENTER")),
+        {"mergeCells": {"range": grid(f"A2:{lc}2"), "mergeType": "MERGE_ALL"}},
+        freq(f"A3:{lc}3", fmt(bg=C_HEADER, bold=True, color=C_WHITE, halign="CENTER")),
+        freq(f"A4:{lc}{last_row}", fmt(halign="LEFT", size=9, wrap=True)),
+        {"updateSheetProperties": {"properties": {"sheetId": sheet_id, "gridProperties": {"frozenRowCount": 3}}, "fields": "gridProperties.frozenRowCount"}},
+    ]
+
+    widths = [90, 70, 400, 100, 110, 70, 60, 60, 90, 90, 120, 100, 80]
+    for i, w in enumerate(widths[:max_cols]):
+        reqs.append({"updateDimensionProperties": {
+            "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": i, "endIndex": i+1},
+            "properties": {"pixelSize": w}, "fields": "pixelSize",
+        }})
+
+    reqs.append({"updateDimensionProperties": {
+        "range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": 3, "endIndex": last_row},
+        "properties": {"pixelSize": 60}, "fields": "pixelSize",
+    }})
+
+    for i in range(0, len(reqs), 100):
+        service.spreadsheets().batchUpdate(spreadsheetId=SALARY_SPREADSHEET_ID, body={"requests": reqs[i:i+100]}).execute()
+        if i + 100 < len(reqs):
+            time.sleep(1)
