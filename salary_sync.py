@@ -369,7 +369,7 @@ def sync_month(year: int = None, month: int = None) -> dict:
 
     # ---- 세션기록 생성 (매출 계산) ----
     session_ws = sh.worksheet("📝세션기록")
-    session_ws.batch_clear(["A5:G304"])
+    session_ws.batch_clear(["A5:H304"])
 
     all_sessions = sorted(parsed_sessions + ot_sessions, key=lambda x: (x["date"], x["time"]))
     session_rows = []
@@ -406,11 +406,11 @@ def sync_month(year: int = None, month: int = None) -> dict:
             target_name, kind, progress_str, revenue_val
         ])
 
-    # 300행까지 빈값
+    # 300행까지 빈값 (컬럼 8개: A~H)
     while len(session_rows) < 300:
-        session_rows.append(["", "", "", "", "", "", ""])
+        session_rows.append(["", "", "", "", "", "", "", ""])
 
-    # 1단계: A~F만 값으로 씀 (G는 뒤에서 수식으로)
+    # 1단계: A~F만 값으로 씀 (G, H는 뒤에서 수식으로)
     # F열(진행회차) "5/1"이 날짜로 자동변환 되는 것 방지 - 아포스트로피 prefix로 텍스트 강제
     values_only = []
     for row in session_rows:
@@ -424,16 +424,19 @@ def sync_month(year: int = None, month: int = None) -> dict:
         value_input_option="USER_ENTERED",
     )
 
-    # 2단계: G열은 수식으로 (매출 = 등록월 몰빵 방식)
-    # progress==1일 때만 매출 잡힘:
+    # 2단계: G열(결제매출 몰빵) + H열(수업료매출) 수식
+    # G: 매출 = 등록월 몰빵. progress==1일 때만.
     #   - 패키지 순수: 80000
     #   - 패키지 혼합(F에 "+" 포함): 80000 + 개인총금액
     #   - 개인 순수: 개인총금액
-    g_formulas = []
+    # H: 수업료 계산용 매출 = 매 세션마다
+    #   - 개인: 개인회당단가 (VLOOKUP F열)
+    #   - 패키지, OT: 0 (요율표 회당단가로 별도 계산)
+    gh_formulas = []
     for i in range(len(session_rows)):
         r = 5 + i
         if session_rows[i][3]:  # D열(매출대상) 있으면 수식
-            g_formulas.append([
+            g_formula = (
                 f'=IF(D{r}="","",'
                 f'IF(E{r}="OT",0,'
                 f'IF(IFERROR(VALUE(REGEXEXTRACT(F{r},"/(\\d+)$")),0)=1,'
@@ -441,12 +444,24 @@ def sync_month(year: int = None, month: int = None) -> dict:
                 f'{PACKAGE_TRAINER_REVENUE}+IF(REGEXMATCH(F{r},"\\+"),IFERROR(VLOOKUP(D{r},\'👥회원명부\'!A:E,5,FALSE),0),0),'
                 f'IFERROR(VLOOKUP(D{r},\'👥회원명부\'!A:E,5,FALSE),0)'
                 f'),0)))'
-            ])
+            )
+            h_formula = (
+                f'=IF(D{r}="","",'
+                f'IF(E{r}="개인",IFERROR(VLOOKUP(D{r},\'👥회원명부\'!A:F,6,FALSE),0),0))'
+            )
+            gh_formulas.append([g_formula, h_formula])
         else:
-            g_formulas.append([""])
+            gh_formulas.append(["", ""])
     session_ws.update(
-        range_name=f"G5:G{5 + len(g_formulas) - 1}",
-        values=g_formulas,
+        range_name=f"G5:H{5 + len(gh_formulas) - 1}",
+        values=gh_formulas,
+        value_input_option="USER_ENTERED",
+    )
+
+    # 세션기록 헤더 업데이트 (H열 추가)
+    session_ws.update(
+        range_name="H4",
+        values=[["수업료매출(자동)"]],
         value_input_option="USER_ENTERED",
     )
 
@@ -604,7 +619,7 @@ def archive_month(year: int = None, month: int = None, clear_sessions: bool = Fa
     # 4. 옵션: 세션기록 클리어 (다음달 준비)
     if clear_sessions:
         session_ws = sh.worksheet("📝세션기록")
-        session_ws.batch_clear(["A5:G304"])
+        session_ws.batch_clear(["A5:H304"])
         logger.info(f"[급여] 📝세션기록 클리어 완료")
 
     logger.info(f"[급여] 아카이브 완료: {year_month} 실수령 {vals['실수령액']:,.0f}원 (session_snap={session_created}, member_snap={member_created})")
