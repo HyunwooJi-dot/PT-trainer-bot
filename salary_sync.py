@@ -65,8 +65,10 @@ def fetch_events(year: int, month: int) -> list:
     creds = _get_credentials()
     service = build("calendar", "v3", credentials=creds)
 
-    start = datetime(year, month, 1, tzinfo=timezone.utc)
-    end = datetime(year + (month // 12), (month % 12) + 1, 1, tzinfo=timezone.utc)
+    # KST 기준 월 경계 (UTC로 저장된 이벤트가 KST 자정 근처일 때 월 소속 안 헷갈리도록)
+    kst = timezone(timedelta(hours=9))
+    start = datetime(year, month, 1, tzinfo=kst)
+    end = datetime(year + (month // 12), (month % 12) + 1, 1, tzinfo=kst)
 
     all_events = []
     page_token = None
@@ -237,26 +239,47 @@ def sync_month(year: int = None, month: int = None) -> dict:
             }
             last_row = i
 
-    # ---- 신규 회원 자동등록 (새 구조) ----
+    # ---- 신규 회원 자동등록 + 기존 회원 확장 감지 (새 구조) ----
     # unknown_members: name -> {패키지등록: 0 or 5, 개인회차: X or 0, reg_type}
+    # updates: name -> {개인회차: N, 패키지등록: 5} (기존 회원인데 값이 커졌을 때)
     unknown_members = {}
+    updates = {}
     for s in parsed_sessions:
-        if s["name"] not in existing_members:
-            cur = unknown_members.get(s["name"], {
+        total = s.get("total_sessions", 0)
+        extra = s.get("extra_sessions", 0)
+        name = s["name"]
+
+        if name not in existing_members:
+            cur = unknown_members.get(name, {
                 "패키지등록": 0, "개인회차": 0, "reg_type": s["reg_type"],
             })
-            total = s.get("total_sessions", 0)
-            extra = s.get("extra_sessions", 0)
             if total == 5:
                 cur["패키지등록"] = 5
                 if extra > 0:
-                    # 5+X 혼합
                     cur["개인회차"] = max(cur["개인회차"], extra)
             elif total > 0:
-                # 개인 등록만
                 cur["개인회차"] = max(cur["개인회차"], total)
             cur["reg_type"] = s["reg_type"]
-            unknown_members[s["name"]] = cur
+            unknown_members[name] = cur
+        else:
+            # 기존 회원인데 캘린더에 더 큰 등록회차가 있으면 갱신 후보
+            em = existing_members[name]
+            cur_pkg = em.get("패키지등록", 0)
+            cur_prv = em.get("개인회차", 0)
+            new_pkg = cur_pkg
+            new_prv = cur_prv
+            if total == 5:
+                new_pkg = 5
+                if extra > 0:
+                    new_prv = max(new_prv, extra)
+            elif total > 0:
+                new_prv = max(new_prv, total)
+
+            if new_pkg > cur_pkg or new_prv > cur_prv:
+                u = updates.get(name, {"패키지등록": cur_pkg, "개인회차": cur_prv, "row": em["row"]})
+                u["패키지등록"] = max(u["패키지등록"], new_pkg)
+                u["개인회차"] = max(u["개인회차"], new_prv)
+                updates[name] = u
 
     ot_only_members = set()
     for s in ot_sessions:
@@ -312,6 +335,22 @@ def sync_month(year: int = None, month: int = None) -> dict:
                 "개인회당단가": 0,  # 사용자 입력 대기
                 "공유회원": None,
             }
+
+    # ---- 기존 회원 확장 갱신 (5회 → 5+10 등) ----
+    for name, u in updates.items():
+        r = u["row"]
+        if not r:
+            continue
+        # B(패키지등록), C(패키지매출), D(개인회차) 갱신 (E 개인총금액은 건드리지 않음)
+        member_ws.batch_update([
+            {"range": f"B{r}", "values": [[u["패키지등록"]]]},
+            {"range": f"C{r}", "values": [[80000 if u["패키지등록"] == 5 else 0]]},
+            {"range": f"D{r}", "values": [[u["개인회차"]]]},
+        ])
+        # existing_members에도 반영
+        existing_members[name]["패키지등록"] = u["패키지등록"]
+        existing_members[name]["개인회차"] = u["개인회차"]
+        logger.info(f"[회원 확장 감지] {name}: 패키지={u['패키지등록']}, 개인회차={u['개인회차']}")
 
     # ---- 세션기록 생성 (매출 계산) ----
     session_ws = sh.worksheet("📝세션기록")
@@ -398,6 +437,10 @@ def sync_month(year: int = None, month: int = None) -> dict:
         "sessions": len(parsed_sessions),
         "ot": len(ot_sessions),
         "new_members": list(unknown_members.keys()) + list(ot_only_members),
+        "updated_members": [
+            f"{n} (패키지={u['패키지등록']}, 개인={u['개인회차']})"
+            for n, u in updates.items()
+        ],
         "failed": failed,
         "total_revenue": int(total_revenue),
     }
