@@ -18,7 +18,7 @@ from telegram.ext import (
     CallbackQueryHandler, filters, ContextTypes
 )
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import sheets
 import ai_homework
 import salary_sync
@@ -779,25 +779,77 @@ async def salary_sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"⚠️ 실패: `{str(e)[:200]}`", parse_mode="Markdown")
 
 
-async def salary_weekly_archive_job(context: ContextTypes.DEFAULT_TYPE):
-    """매주 일요일 새벽 이번 달 급여 데이터를 월별기록 시트에 저장"""
+def _prev_month(year: int, month: int):
+    """이전 달 (year, month) 반환"""
+    if month == 1:
+        return year - 1, 12
+    return year, month - 1
+
+
+async def salary_monthly_archive_job(context: ContextTypes.DEFAULT_TYPE):
+    """매일 새벽 3시 실행. 오늘이 매달 1일이면 지난 달을 아카이브."""
+    kst_now = datetime.now(timezone(timedelta(hours=9)))
+    if kst_now.day != 1:
+        return
+
+    prev_y, prev_m = _prev_month(kst_now.year, kst_now.month)
+    year_month = f"{prev_y}-{prev_m:02d}"
     try:
-        result = salary_sync.archive_month()
+        result = salary_sync.archive_month(prev_y, prev_m, clear_sessions=True)
         msg = (
-            f"📚 *월별 급여 자동 아카이브* ({result['year_month']})\n"
+            f"📚 *월별 자동 아카이브 완료* ({result['year_month']})\n"
             f"━━━━━━━━━━━━━━\n"
             f"총매출:   `{result['총매출']:>12,.0f}원`\n"
-            f"실수령액: `{result['실수령액']:>12,.0f}원`\n\n"
-            f"월별기록 시트에 저장됨"
+            f"실수령액: `{result['실수령액']:>12,.0f}원`\n"
         )
+        if result.get("session_snapshot_created"):
+            msg += f"📦 세션 스냅샷 생성됨\n"
+        if result.get("member_snapshot_created"):
+            msg += f"📦 회원 스냅샷 생성됨\n"
+        msg += f"\n다음 달 준비 완료 (세션기록 초기화)"
         if TRAINER_CHAT_ID:
-            await context.bot.send_message(
-                chat_id=TRAINER_CHAT_ID,
-                text=msg,
-                parse_mode="Markdown",
-            )
+            await context.bot.send_message(chat_id=TRAINER_CHAT_ID, text=msg, parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"[급여 아카이브 오류] {e}")
+        logger.error(f"[월별 아카이브 오류] {e}")
+        if TRAINER_CHAT_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=TRAINER_CHAT_ID,
+                    text=f"⚠️ 월별 아카이브 실패 ({year_month})\n`{str(e)[:200]}`",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+
+
+async def salary_archive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """수동 아카이브. /archive 또는 /archive YYYY MM"""
+    args = context.args or []
+    if len(args) >= 2:
+        try:
+            year, month = int(args[0]), int(args[1])
+        except ValueError:
+            await update.message.reply_text("사용법: `/archive` (지난달) 또는 `/archive 2026 8`", parse_mode="Markdown")
+            return
+    else:
+        kst_now = datetime.now(timezone(timedelta(hours=9)))
+        year, month = _prev_month(kst_now.year, kst_now.month)
+
+    await update.message.reply_text(f"📚 {year}-{month:02d} 아카이브 중...", parse_mode="Markdown")
+    try:
+        result = salary_sync.archive_month(year, month, clear_sessions=False)
+        msg = (
+            f"✅ *아카이브 완료* ({result['year_month']})\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"총매출:   `{result['총매출']:>12,.0f}원`\n"
+            f"실수령액: `{result['실수령액']:>12,.0f}원`\n"
+        )
+        msg += f"📦 세션 스냅샷: {'생성' if result.get('session_snapshot_created') else '이미 있음'}\n"
+        msg += f"📦 회원 스냅샷: {'생성' if result.get('member_snapshot_created') else '이미 있음'}\n"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"[/archive 오류] {e}")
+        await update.message.reply_text(f"⚠️ 실패: `{str(e)[:200]}`", parse_mode="Markdown")
 
 
 # ─────────────────────────────────────────────
@@ -820,6 +872,7 @@ def main():
     app.add_handler(CommandHandler("homework", generate_homework_command))
     app.add_handler(CommandHandler("class", add_class))
     app.add_handler(CommandHandler("salary", salary_sync_command))
+    app.add_handler(CommandHandler("archive", salary_archive_command))
 
     # 콜백
     app.add_handler(CallbackQueryHandler(handle_workout_done, pattern="^done_"))
@@ -839,11 +892,10 @@ def main():
     # 💰 급여 자동 동기화 (한국 시간 22:00 = UTC 13:00, nightly와 5분 차이)
     app.job_queue.run_daily(salary_daily_sync_job, time=dtime(hour=13, minute=5))
 
-    # 📚 급여 월별 아카이브 (한국 일요일 03:00 = UTC 토요일 18:00)
+    # 📚 급여 월별 아카이브 (매일 KST 03:00 = UTC 18:00 실행, 매달 1일에만 동작)
     app.job_queue.run_daily(
-        salary_weekly_archive_job,
+        salary_monthly_archive_job,
         time=dtime(hour=18, minute=0),
-        days=(5,),  # 5 = 토요일 UTC (한국 일요일 새벽)
     )
 
     logger.info("🤖 PT 봇 v2 시작!")
