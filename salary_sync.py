@@ -481,8 +481,39 @@ def read_dashboard_values() -> dict:
 
 
 # ---------- 월별기록 아카이브 ----------
-def archive_month(year: int = None, month: int = None) -> dict:
-    """이번 달 데이터를 💼월별기록 시트에 저장"""
+def _snapshot_worksheet(sh, source_title: str, target_title: str):
+    """source 워크시트를 target 이름으로 복제 (값만 복사, 이미 있으면 스킵)"""
+    # 이미 존재하면 스킵 (idempotent)
+    try:
+        sh.worksheet(target_title)
+        return False  # 이미 존재
+    except gspread.WorksheetNotFound:
+        pass
+
+    src = sh.worksheet(source_title)
+    # 값만 읽어와서 새 시트에 넣기 (수식은 정적 값으로 고정)
+    values = src.get_all_values()
+    if not values:
+        return False
+
+    rows = len(values)
+    cols = max(len(r) for r in values) if values else 10
+    new_ws = sh.add_worksheet(title=target_title, rows=max(rows + 10, 100), cols=max(cols + 2, 15))
+    new_ws.update(
+        range_name=f"A1:{gspread.utils.rowcol_to_a1(rows, cols)}",
+        values=values,
+        value_input_option="RAW",
+    )
+    return True
+
+
+def archive_month(year: int = None, month: int = None, clear_sessions: bool = False) -> dict:
+    """
+    지정 월 데이터를 아카이브 (기본: 이번 달)
+    - 📦 {YYYY-MM}_세션, 📦 {YYYY-MM}_회원 시트 자동 생성 (있으면 스킵)
+    - 💼월별기록에 요약 한 줄 추가/갱신
+    - clear_sessions=True면 아카이브 후 📝세션기록 클리어 (다음달 준비)
+    """
     if year is None or month is None:
         now = datetime.now(timezone(timedelta(hours=9)))
         year, month = now.year, now.month
@@ -495,15 +526,21 @@ def archive_month(year: int = None, month: int = None) -> dict:
     creds = _get_credentials()
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(SALARY_SPREADSHEET_ID)
-    history = sh.worksheet("💼월별기록")
 
+    # 1. 스냅샷 시트 생성 (이미 있으면 스킵)
+    session_snap = f"📦 {year_month}_세션"
+    member_snap = f"📦 {year_month}_회원"
+    session_created = _snapshot_worksheet(sh, "📝세션기록", session_snap)
+    member_created = _snapshot_worksheet(sh, "👥회원명부", member_snap)
+
+    # 2. 월별기록에 요약 행 갱신
+    history = sh.worksheet("💼월별기록")
     all_data = history.get_all_values()
     target_row = None
     for i, row in enumerate(all_data[6:], start=7):
         if row and row[0].strip() == year_month:
             target_row = i
             break
-
     if target_row is None:
         last_data_row = 6
         for i, row in enumerate(all_data[6:], start=7):
@@ -518,15 +555,45 @@ def archive_month(year: int = None, month: int = None) -> dict:
         vals["기본급"], vals["수업료성과금"], vals["인센티브"], vals["패키지급여"],
         vals["총지급액"], vals["실수령액"],
     ]
-
     history.update(
         range_name=f"A{target_row}:L{target_row}",
         values=[row_data],
         value_input_option="USER_ENTERED",
     )
 
-    logger.info(f"[급여] 아카이브 완료: {year_month} 실수령 {vals['실수령액']:,.0f}원")
-    return {**vals, "year_month": year_month}
+    # 3. 합계/평균/추이 수식 재설정 (7행부터 마지막 데이터 행까지)
+    last_row = max(target_row, 7)
+    cols = "BCDEFGHIJKL"  # 11개 지표 열
+
+    sum_row  = [f'=SUM({c}7:{c}{last_row})' for c in cols]
+    avg_row  = [f'=IFERROR(AVERAGE({c}7:{c}{last_row}),0)' for c in cols]
+    # 3행에 추이 스파크라인 (각 지표별 월간 라인차트)
+    trend_row = [
+        f'=IFERROR(SPARKLINE({c}7:{c}{last_row},{{"charttype","line";"color1","#4285F4";"linewidth",2}}),"")'
+        for c in cols
+    ]
+
+    history.batch_update([
+        {"range": "A3", "values": [["📈 추이"]]},
+        {"range": "B3:L3", "values": [trend_row]},
+        {"range": "B5:L5", "values": [sum_row]},
+        {"range": "B6:L6", "values": [avg_row]},
+    ])
+
+    # 4. 옵션: 세션기록 클리어 (다음달 준비)
+    if clear_sessions:
+        session_ws = sh.worksheet("📝세션기록")
+        session_ws.batch_clear(["A5:G304"])
+        logger.info(f"[급여] 📝세션기록 클리어 완료")
+
+    logger.info(f"[급여] 아카이브 완료: {year_month} 실수령 {vals['실수령액']:,.0f}원 (session_snap={session_created}, member_snap={member_created})")
+    return {
+        **vals,
+        "year_month": year_month,
+        "session_snapshot_created": session_created,
+        "member_snapshot_created": member_created,
+        "sessions_cleared": clear_sessions,
+    }
 
 
 # ---------- 회원관리 시트 동기화 ----------
