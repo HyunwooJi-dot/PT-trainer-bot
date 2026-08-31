@@ -741,6 +741,44 @@ async def salary_daily_sync_job(context: ContextTypes.DEFAULT_TYPE):
                 pass
 
 
+async def salary_sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """수동 즉시 재동기화. /salary 또는 /salary YYYY MM"""
+    args = context.args or []
+    year = month = None
+    if len(args) >= 2:
+        try:
+            year, month = int(args[0]), int(args[1])
+        except ValueError:
+            await update.message.reply_text("사용법: `/salary` 또는 `/salary 2026 8`", parse_mode="Markdown")
+            return
+
+    await update.message.reply_text("💰 급여 시트 재동기화 중...", parse_mode="Markdown")
+    try:
+        result = salary_sync.sync_month(year, month) if year else salary_sync.sync_month()
+        try:
+            salary_sync.sync_member_list()
+        except Exception as me:
+            logger.error(f"[회원관리 동기화 오류] {me}")
+
+        vals = salary_sync.read_dashboard_values()
+        msg = (
+            f"✅ *재동기화 완료* ({result['year_month']})\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"정상 세션: *{result['sessions']}개* (OT {result['ot']}개)\n"
+            f"총매출:    `{vals['총매출']:>12,.0f}원`\n"
+            f"실수령액:  `{vals['실수령액']:>12,.0f}원`\n"
+        )
+        if result.get("new_members"):
+            msg += f"🆕 신규: {', '.join(result['new_members'])}\n"
+        if result.get("failed"):
+            msg += f"⚠️ 파싱 실패 {len(result['failed'])}개\n"
+        msg += f"\n📎 [시트 열기](https://docs.google.com/spreadsheets/d/{salary_sync.SALARY_SPREADSHEET_ID}/edit)"
+        await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"[/salary 오류] {e}")
+        await update.message.reply_text(f"⚠️ 실패: `{str(e)[:200]}`", parse_mode="Markdown")
+
+
 async def salary_weekly_archive_job(context: ContextTypes.DEFAULT_TYPE):
     """매주 일요일 새벽 이번 달 급여 데이터를 월별기록 시트에 저장"""
     try:
@@ -781,6 +819,7 @@ def main():
     app.add_handler(CommandHandler("done", class_done_command))
     app.add_handler(CommandHandler("homework", generate_homework_command))
     app.add_handler(CommandHandler("class", add_class))
+    app.add_handler(CommandHandler("salary", salary_sync_command))
 
     # 콜백
     app.add_handler(CallbackQueryHandler(handle_workout_done, pattern="^done_"))
