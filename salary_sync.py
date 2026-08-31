@@ -331,7 +331,9 @@ def sync_month(year: int = None, month: int = None) -> dict:
                 member_info = target_info
 
         kind = classify_session(s)
-        revenue = calc_session_revenue(s, member_info)
+        # 매출은 수식으로 넣어서 회원명부 수정 시 즉시 반영되도록 함
+        # (revenue 값 계산은 total_revenue 집계용으로만 사용)
+        revenue_val = calc_session_revenue(s, member_info)
 
         # 진행회차 표기
         if s.get("is_ot"):
@@ -347,20 +349,48 @@ def sync_month(year: int = None, month: int = None) -> dict:
 
         session_rows.append([
             s["date"], s["time"], name,
-            target_name, kind, progress_str, revenue
+            target_name, kind, progress_str, revenue_val
         ])
 
     # 300행까지 빈값
     while len(session_rows) < 300:
         session_rows.append(["", "", "", "", "", "", ""])
 
+    # 1단계: A~F만 값으로 씀 (G는 뒤에서 수식으로)
+    # F열(진행회차) "5/1"이 날짜로 자동변환 되는 것 방지 - 아포스트로피 prefix로 텍스트 강제
+    values_only = []
+    for row in session_rows:
+        r = list(row[:6])
+        if r[5] and not str(r[5]).startswith("'"):
+            r[5] = "'" + str(r[5])
+        values_only.append(r)
     session_ws.update(
-        range_name=f"A5:G{5 + len(session_rows) - 1}",
-        values=session_rows,
+        range_name=f"A5:F{5 + len(values_only) - 1}",
+        values=values_only,
         value_input_option="USER_ENTERED",
     )
 
-    # 매출 총합 계산 (알림용)
+    # 2단계: G열은 수식으로 (회원명부 개인회당단가 변경 시 자동 반영)
+    # OT=0, 패키지 1회차=0/그외=20000, 개인=VLOOKUP(D, 회원명부!A:F, 6)
+    g_formulas = []
+    for i in range(len(session_rows)):
+        r = 5 + i
+        if session_rows[i][3]:  # D열(매출대상) 있으면 수식
+            g_formulas.append([
+                f'=IF(D{r}="","",'
+                f'IF(E{r}="OT",0,'
+                f'IF(E{r}="패키지",IF(IFERROR(VALUE(REGEXEXTRACT(F{r},"/(\\d+)$")),0)=1,0,{PACKAGE_REVENUE_PER_SESSION}),'
+                f'IFERROR(VLOOKUP(D{r},\'👥회원명부\'!A:F,6,FALSE),0))))'
+            ])
+        else:
+            g_formulas.append([""])
+    session_ws.update(
+        range_name=f"G5:G{5 + len(g_formulas) - 1}",
+        values=g_formulas,
+        value_input_option="USER_ENTERED",
+    )
+
+    # 매출 총합 계산 (알림용, 파이썬 계산값 기준)
     total_revenue = sum(r[6] for r in session_rows if isinstance(r[6], (int, float)))
 
     result = {
