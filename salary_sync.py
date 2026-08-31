@@ -151,7 +151,7 @@ def parse_event(event: dict) -> dict | None:
 
 
 # ---------- 메인 동기화 함수 ----------
-PACKAGE_REVENUE_PER_SESSION = 20000  # 패키지 2~5회차 세션당 매출
+PACKAGE_TRAINER_REVENUE = 80000  # 5회 패키지 트레이너 매출 (10만 - 회사 2만)
 
 
 def classify_session(session: dict) -> str:
@@ -165,19 +165,32 @@ def classify_session(session: dict) -> str:
 
 
 def calc_session_revenue(session: dict, member_info: dict | None) -> int:
-    """세션 매출 계산. member_info는 회원명부에서 조회한 매출대상 회원의 정보."""
-    kind = classify_session(session)
-    if kind == "OT":
+    """
+    매출 = 그 달의 총 결제금액 (등록월 몰빵 방식).
+    첫 세션(progress=1)에서 등록비 전체 매출로 잡음.
+    - 5/1        → 8만원 (순수 패키지)
+    - X/1 (X≠5)  → 개인총금액 (순수 개인)
+    - 5+X/1      → 8만원 + 개인총금액 (혼합)
+    - progress > 1 세션 → 0 (이미 등록월에 잡힘)
+    """
+    if session.get("is_ot"):
         return 0
-    if kind == "패키지":
-        # 진행회차 1이면 회사가 가져감 (매출 0), 그 외 회당 2만원
-        if session.get("progress", 1) == 1:
-            return 0
-        return PACKAGE_REVENUE_PER_SESSION
-    # 개인 PT: 회원명부의 개인회당단가 참조
-    if member_info is None:
+    if session.get("progress", 0) != 1:
         return 0
-    return int(member_info.get("개인회당단가", 0) or 0)
+
+    total = session.get("total_sessions", 0)
+    extra = session.get("extra_sessions", 0)
+    revenue = 0
+
+    if total == 5:
+        revenue += PACKAGE_TRAINER_REVENUE  # 패키지 8만원
+        if extra > 0 and member_info:
+            revenue += int(member_info.get("개인총금액", 0) or 0)
+    elif total > 0:
+        # 순수 개인 등록
+        if member_info:
+            revenue += int(member_info.get("개인총금액", 0) or 0)
+    return revenue
 
 
 def sync_month(year: int = None, month: int = None) -> dict:
@@ -234,6 +247,7 @@ def sync_month(year: int = None, month: int = None) -> dict:
                 "row": i,
                 "패키지등록": int(to_num(row[1]) if len(row) > 1 else 0),
                 "개인회차":   int(to_num(row[3]) if len(row) > 3 else 0),
+                "개인총금액": to_num(row[4]) if len(row) > 4 else 0,
                 "개인회당단가": to_num(row[5]) if len(row) > 5 else 0,
                 "공유회원":   (row[7].strip() if len(row) > 7 else "") or None,
             }
@@ -332,7 +346,8 @@ def sync_month(year: int = None, month: int = None) -> dict:
                 "row": None,
                 "패키지등록": info["패키지등록"],
                 "개인회차": info["개인회차"],
-                "개인회당단가": 0,  # 사용자 입력 대기
+                "개인총금액": 0,  # 사용자 입력 대기
+                "개인회당단가": 0,
                 "공유회원": None,
             }
 
@@ -409,8 +424,11 @@ def sync_month(year: int = None, month: int = None) -> dict:
         value_input_option="USER_ENTERED",
     )
 
-    # 2단계: G열은 수식으로 (회원명부 개인회당단가 변경 시 자동 반영)
-    # OT=0, 패키지 1회차=0/그외=20000, 개인=VLOOKUP(D, 회원명부!A:F, 6)
+    # 2단계: G열은 수식으로 (매출 = 등록월 몰빵 방식)
+    # progress==1일 때만 매출 잡힘:
+    #   - 패키지 순수: 80000
+    #   - 패키지 혼합(F에 "+" 포함): 80000 + 개인총금액
+    #   - 개인 순수: 개인총금액
     g_formulas = []
     for i in range(len(session_rows)):
         r = 5 + i
@@ -418,8 +436,11 @@ def sync_month(year: int = None, month: int = None) -> dict:
             g_formulas.append([
                 f'=IF(D{r}="","",'
                 f'IF(E{r}="OT",0,'
-                f'IF(E{r}="패키지",IF(IFERROR(VALUE(REGEXEXTRACT(F{r},"/(\\d+)$")),0)=1,0,{PACKAGE_REVENUE_PER_SESSION}),'
-                f'IFERROR(VLOOKUP(D{r},\'👥회원명부\'!A:F,6,FALSE),0))))'
+                f'IF(IFERROR(VALUE(REGEXEXTRACT(F{r},"/(\\d+)$")),0)=1,'
+                f'IF(E{r}="패키지",'
+                f'{PACKAGE_TRAINER_REVENUE}+IF(REGEXMATCH(F{r},"\\+"),IFERROR(VLOOKUP(D{r},\'👥회원명부\'!A:E,5,FALSE),0),0),'
+                f'IFERROR(VLOOKUP(D{r},\'👥회원명부\'!A:E,5,FALSE),0)'
+                f'),0)))'
             ])
         else:
             g_formulas.append([""])
