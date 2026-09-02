@@ -34,6 +34,20 @@ TRAINER_NAME = os.getenv("TRAINER_NAME", "현우")
 SOURCE_MEMBER_SHEET_ID = os.getenv("SOURCE_MEMBER_SHEET_ID", "1IN4z0J7V0rXSJdONItieQqinvtTBU_f8CDs1xsB2Ito")
 TRAINER_FULLNAME = os.getenv("TRAINER_FULLNAME", "지현우")
 MEMBER_TARGET_SHEET_NAME = "🧑‍💼회원관리 및 특이사항"
+UNIFIED_SHEET_NAME = "🧑통합회원리스트"
+
+# 성별 시드 (사용자가 알려준 정보. 이후 시트에서 수동 수정한 값이 우선)
+GENDER_SEED = {
+    "박진범": "남", "김현수": "남", "김우영": "남", "손상원": "남", "김춘길": "남",
+    "윤효은": "여", "노한별": "여", "전수민": "여", "임도연": "여", "양해인": "여",
+    "이한솔": "여", "김하늘": "여", "오근영": "여", "허윤진": "여", "윤솔": "여",
+    "이정은": "여", "한주희": "여", "임다나": "여", "강효원": "여", "김도영": "여",
+    "박영": "여", "권효원": "여", "고애선": "여",
+}
+# 이름 오타 매핑 (원본 → 정정)
+NAME_ALIASES = {
+    "고선애": "고애선",
+}
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -784,6 +798,199 @@ def sync_member_list(months=(0, -1)) -> dict:
         "members": total_members,
         "tab": tabs_label,
         "months": len(monthly_data),
+    }
+
+
+def sync_unified_member_list() -> dict:
+    """
+    회원명부(캘린더 기반) + 답십리점 관리표를 병합한 통합 회원 리스트.
+    - 시트: 🧑통합회원리스트
+    - 성별 우선순위: 시트에 이미 있는 값 > OT관리표 이름 suffix (남)/(여) > GENDER_SEED > 미상
+    - 사용자가 시트의 성별 열을 직접 편집하면 다음 sync에서 보존됨
+    - 마지막 행에 남/여/미상 카운트
+    """
+    logger.info("[통합회원] 동기화 시작")
+
+    creds = _get_credentials()
+    gc = gspread.authorize(creds)
+    service = build("sheets", "v4", credentials=creds)
+
+    sh = gc.open_by_key(SALARY_SPREADSHEET_ID)
+
+    # 1. 회원명부에서 이름들 수집
+    member_ws = sh.worksheet("👥회원명부")
+    member_data = member_ws.get_all_values()
+    member_names = set()
+    member_info = {}  # name -> "5+10회" 같은 요약
+    for row in member_data[4:]:
+        if row and row[0].strip():
+            n = NAME_ALIASES.get(row[0].strip(), row[0].strip())
+            member_names.add(n)
+            pkg = row[1].strip() if len(row) > 1 else ""
+            prv = row[3].strip() if len(row) > 3 else ""
+            parts = []
+            if pkg and pkg not in ("0", "0회"): parts.append(f"패키지 {pkg}")
+            if prv and prv not in ("0", "0회"): parts.append(f"개인 {prv}")
+            member_info[n] = " / ".join(parts) or "-"
+
+    # 2. OT관리표 (이번+지난달) 이름 + 성별 추출
+    src = gc.open_by_key(SOURCE_MEMBER_SHEET_ID)
+    ot_names = {}  # name -> {"gender": "남/여/미상", "note": ..., "month": ...}
+    import re as _re
+    name_pattern = _re.compile(r"(.+?)\(([남여])\)")
+    for offset in (0, -1):
+        tab = _get_month_tab_name(offset)
+        h, rows = _fetch_month_data(src, tab)
+        if h is None: continue
+        try:
+            note_col = h.index("특이사항")
+        except ValueError:
+            note_col = 2
+        for r in rows:
+            if not r or not r[0].strip(): continue
+            raw = r[0].strip()
+            m = name_pattern.match(raw)
+            if m:
+                n = NAME_ALIASES.get(m.group(1).strip(), m.group(1).strip())
+                g = m.group(2)
+            else:
+                n = NAME_ALIASES.get(raw, raw)
+                g = ""
+            note = r[note_col].strip() if len(r) > note_col else ""
+            if n not in ot_names or (g and not ot_names[n].get("gender")):
+                ot_names[n] = {"gender": g, "note": note[:80], "month": tab}
+
+    # 3. 기존 통합시트의 사용자 편집 성별 읽기 (덮어쓰기 방지)
+    user_gender = {}
+    try:
+        uni_ws = sh.worksheet(UNIFIED_SHEET_NAME)
+        existing = uni_ws.get_all_values()
+        header_row_idx = None
+        for i, r in enumerate(existing):
+            if r and r[0] == "이름":
+                header_row_idx = i
+                break
+        if header_row_idx is not None:
+            for r in existing[header_row_idx + 1:]:
+                if r and r[0].strip() and len(r) > 1:
+                    g = r[1].strip()
+                    if g in ("남", "여"):
+                        user_gender[r[0].strip()] = g
+    except gspread.WorksheetNotFound:
+        pass
+
+    # 4. 이름 통합 + 성별 결정
+    all_names = member_names | set(ot_names.keys())
+    unified = []
+    for n in sorted(all_names, key=lambda x: (x not in member_names, x not in ot_names, x)):
+        # 성별 결정: 사용자편집 > SEED (도움 직접 확인) > OT suffix > 미상
+        gender = user_gender.get(n) or GENDER_SEED.get(n) or ot_names.get(n, {}).get("gender") or "미상"
+        source = []
+        if n in member_names: source.append("📅회원명부")
+        if n in ot_names: source.append("📋OT관리표")
+        info = member_info.get(n, "-")
+        note = ot_names.get(n, {}).get("note", "")
+        unified.append([n, gender, " + ".join(source), info, note])
+
+    # 5. 카운트
+    male = [u[0] for u in unified if u[1] == "남"]
+    female = [u[0] for u in unified if u[1] == "여"]
+    unknown = [u[0] for u in unified if u[1] not in ("남", "여")]
+
+    # 6. 시트 준비/갱신
+    try:
+        uni_ws = sh.worksheet(UNIFIED_SHEET_NAME)
+        uni_ws.clear()
+        sheet_id = uni_ws.id
+    except gspread.WorksheetNotFound:
+        req = {"addSheet": {"properties": {
+            "title": UNIFIED_SHEET_NAME,
+            "gridProperties": {"rowCount": len(unified) + 20, "columnCount": 5},
+        }}}
+        res = service.spreadsheets().batchUpdate(
+            spreadsheetId=SALARY_SPREADSHEET_ID, body={"requests": [req]}
+        ).execute()
+        sheet_id = res["replies"][0]["addSheet"]["properties"]["sheetId"]
+        uni_ws = sh.worksheet(UNIFIED_SHEET_NAME)
+
+    now_kr = datetime.now(timezone(timedelta(hours=9)))
+    out = [
+        [f"🧑 통합 회원 리스트 (회원명부 + OT관리표)", "", "", "", ""],
+        [f"💡 성별은 직접 수정 가능. 다음 sync에서 편집값 보존됨.  ·  갱신: {now_kr.strftime('%Y-%m-%d %H:%M')}", "", "", "", ""],
+        ["", "", "", "", ""],
+        ["이름", "성별", "출처", "등록정보", "특이사항"],
+    ]
+    for u in unified:
+        out.append(u)
+
+    # 카운트 요약 행
+    out.append(["", "", "", "", ""])
+    out.append([
+        f"📊 총 {len(unified)}명",
+        f"남 {len(male)}",
+        f"여 {len(female)}",
+        f"미상 {len(unknown)}",
+        "",
+    ])
+
+    uni_ws.update(range_name=f"A1:E{len(out)}", values=out, value_input_option="USER_ENTERED")
+
+    # 서식
+    header_row = 4
+    total_row = len(out)
+    fmt_requests = [
+        # 제목
+        {"repeatCell": {
+            "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 5},
+            "cell": {"userEnteredFormat": {
+                "backgroundColor": {"red": 0.26, "green": 0.52, "blue": 0.96},
+                "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1}, "bold": True, "fontSize": 12},
+            }},
+            "fields": "userEnteredFormat(backgroundColor,textFormat)",
+        }},
+        {"mergeCells": {"range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 5}, "mergeType": "MERGE_ALL"}},
+        {"mergeCells": {"range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": 5}, "mergeType": "MERGE_ALL"}},
+        # 헤더 행
+        {"repeatCell": {
+            "range": {"sheetId": sheet_id, "startRowIndex": header_row - 1, "endRowIndex": header_row, "startColumnIndex": 0, "endColumnIndex": 5},
+            "cell": {"userEnteredFormat": {
+                "backgroundColor": {"red": 0.90, "green": 0.90, "blue": 0.95},
+                "textFormat": {"bold": True},
+                "horizontalAlignment": "CENTER",
+            }},
+            "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
+        }},
+        # 합계 행
+        {"repeatCell": {
+            "range": {"sheetId": sheet_id, "startRowIndex": total_row - 1, "endRowIndex": total_row, "startColumnIndex": 0, "endColumnIndex": 5},
+            "cell": {"userEnteredFormat": {
+                "backgroundColor": {"red": 1, "green": 0.95, "blue": 0.80},
+                "textFormat": {"bold": True, "fontSize": 11},
+                "horizontalAlignment": "CENTER",
+            }},
+            "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
+        }},
+        # 열 너비 (이름 100, 성별 60, 출처 180, 등록 150, 특이사항 300)
+        {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 100}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2}, "properties": {"pixelSize": 60}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 3}, "properties": {"pixelSize": 200}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 3, "endIndex": 4}, "properties": {"pixelSize": 150}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 4, "endIndex": 5}, "properties": {"pixelSize": 320}, "fields": "pixelSize"}},
+    ]
+    try:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=SALARY_SPREADSHEET_ID, body={"requests": fmt_requests}
+        ).execute()
+    except Exception as e:
+        logger.warning(f"[통합회원] 서식 실패: {e}")
+
+    logger.info(f"[통합회원] 완료: 총 {len(unified)} (남 {len(male)} 여 {len(female)} 미상 {len(unknown)})")
+    return {
+        "total": len(unified),
+        "male": len(male),
+        "female": len(female),
+        "unknown": len(unknown),
+        "unknown_names": unknown,
     }
 
 
