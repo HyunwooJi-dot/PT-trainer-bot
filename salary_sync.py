@@ -383,9 +383,11 @@ def sync_month(year: int = None, month: int = None) -> dict:
 
     # ---- 세션기록 생성 (매출 계산) ----
     session_ws = sh.worksheet("📝세션기록")
-    session_ws.batch_clear(["A5:H304"])
+    session_ws.batch_clear(["A5:I304"])
 
     all_sessions = sorted(parsed_sessions + ot_sessions, key=lambda x: (x["date"], x["time"]))
+    # 이달첫등록세션 판별: 회원(공유회원 반영된 매출대상)별로 첫 progress=1 세션만 매출 몰빵
+    first_charge_seen = set()
     session_rows = []
     for s in all_sessions:
         name = s["name"]
@@ -399,11 +401,18 @@ def sync_month(year: int = None, month: int = None) -> dict:
                 member_info = target_info
 
         kind = classify_session(s)
-        # 매출은 수식으로 넣어서 회원명부 수정 시 즉시 반영되도록 함
-        # (revenue 값 계산은 total_revenue 집계용으로만 사용)
-        revenue_val = calc_session_revenue(s, member_info)
 
-        # 진행회차 표기
+        # 이 세션이 이달 첫 등록 세션인지 (매출 몰빵 대상)
+        is_first_charge = 0
+        if not s.get("is_ot") and s.get("progress", 0) == 1:
+            if target_name not in first_charge_seen:
+                is_first_charge = 1
+                first_charge_seen.add(target_name)
+
+        # 매출 값 (파이썬 계산: 알림용)
+        revenue_val = calc_session_revenue(s, member_info) if is_first_charge else 0
+
+        # 진행회차 표기 - 도움 표기법: 5/N+X (앞: 패키지 진행, 뒤: 개인 대기)
         if s.get("is_ot"):
             progress_str = "OT"
         else:
@@ -411,18 +420,18 @@ def sync_month(year: int = None, month: int = None) -> dict:
             extra = s.get("extra_sessions", 0)
             progress = s.get("progress", 0)
             if extra > 0:
-                progress_str = f"{total}+{extra}/{progress}"
+                progress_str = f"{total}/{progress}+{extra}"
             else:
                 progress_str = f"{total}/{progress}"
 
         session_rows.append([
             s["date"], s["time"], name,
-            target_name, kind, progress_str, revenue_val
+            target_name, kind, progress_str, revenue_val, 0, is_first_charge  # G,H는 수식, I=매출대상세션
         ])
 
-    # 300행까지 빈값 (컬럼 8개: A~H)
+    # 300행까지 빈값 (컬럼 9개: A~I)
     while len(session_rows) < 300:
-        session_rows.append(["", "", "", "", "", "", "", ""])
+        session_rows.append(["", "", "", "", "", "", "", "", ""])
 
     # 1단계: A~F만 값으로 씀 (G, H는 뒤에서 수식으로)
     # F열(진행회차) "5/1"이 날짜로 자동변환 되는 것 방지 - 아포스트로피 prefix로 텍스트 강제
@@ -438,44 +447,51 @@ def sync_month(year: int = None, month: int = None) -> dict:
         value_input_option="USER_ENTERED",
     )
 
-    # 2단계: G열(결제매출 몰빵) + H열(수업료매출) 수식
-    # G: 매출 = 등록월 몰빵. progress==1일 때만.
+    # 2단계: G열(결제매출) + H열(수업료매출) 수식 + I열(매출대상 flag) 파이썬 값
+    # I: 파이썬이 결정 (이달 회원별 첫 등록세션만 1). 5/1+10 첫세션 이후 10/1 세션 무시.
+    # G: I=1일 때만 매출 몰빵 (등록비 총액)
     #   - 패키지 순수: 80000
     #   - 패키지 혼합(F에 "+" 포함): 80000 + 개인총금액
     #   - 개인 순수: 개인총금액
-    # H: 수업료 계산용 매출 = 매 세션마다
-    #   - 개인: 개인회당단가 (VLOOKUP F열)
-    #   - 패키지, OT: 0 (요율표 회당단가로 별도 계산)
+    # H: 개인 세션마다 회당단가 (수업료 성과금 계산용)
     gh_formulas = []
+    i_values = []
     for i in range(len(session_rows)):
         r = 5 + i
         if session_rows[i][3]:  # D열(매출대상) 있으면 수식
             g_formula = (
                 f'=IF(D{r}="","",'
-                f'IF(E{r}="OT",0,'
-                f'IF(IFERROR(VALUE(REGEXEXTRACT(F{r},"/(\\d+)$")),0)=1,'
+                f'IF(I{r}=1,'
                 f'IF(E{r}="패키지",'
                 f'{PACKAGE_TRAINER_REVENUE}+IF(REGEXMATCH(F{r},"\\+"),IFERROR(VLOOKUP(D{r},\'👥회원명부\'!A:E,5,FALSE),0),0),'
                 f'IFERROR(VLOOKUP(D{r},\'👥회원명부\'!A:E,5,FALSE),0)'
-                f'),0)))'
+                f'),0))'
             )
             h_formula = (
                 f'=IF(D{r}="","",'
                 f'IF(E{r}="개인",IFERROR(VLOOKUP(D{r},\'👥회원명부\'!A:F,6,FALSE),0),0))'
             )
             gh_formulas.append([g_formula, h_formula])
+            i_values.append([session_rows[i][8]])  # 파이썬 계산값
         else:
             gh_formulas.append(["", ""])
+            i_values.append([""])
+
     session_ws.update(
         range_name=f"G5:H{5 + len(gh_formulas) - 1}",
         values=gh_formulas,
         value_input_option="USER_ENTERED",
     )
-
-    # 세션기록 헤더 업데이트 (H열 추가)
     session_ws.update(
-        range_name="H4",
-        values=[["수업료매출(자동)"]],
+        range_name=f"I5:I{5 + len(i_values) - 1}",
+        values=i_values,
+        value_input_option="USER_ENTERED",
+    )
+
+    # 세션기록 헤더 업데이트 (H, I열 추가)
+    session_ws.update(
+        range_name="H4:I4",
+        values=[["수업료매출(자동)", "이달첫등록(자동)"]],
         value_input_option="USER_ENTERED",
     )
 
@@ -633,7 +649,7 @@ def archive_month(year: int = None, month: int = None, clear_sessions: bool = Fa
     # 4. 옵션: 세션기록 클리어 (다음달 준비)
     if clear_sessions:
         session_ws = sh.worksheet("📝세션기록")
-        session_ws.batch_clear(["A5:H304"])
+        session_ws.batch_clear(["A5:I304"])
         logger.info(f"[급여] 📝세션기록 클리어 완료")
 
     logger.info(f"[급여] 아카이브 완료: {year_month} 실수령 {vals['실수령액']:,.0f}원 (session_snap={session_created}, member_snap={member_created})")
@@ -697,7 +713,7 @@ def _fetch_month_data(source_sh, tab_name):
     return header, filtered
 
 
-def sync_member_list(months=(0, -1)) -> dict:
+def sync_member_list(months=(0, -1, -2)) -> dict:
     """
     답십리점 오티 관리표 → 급여계산기 '회원관리 및 특이사항' 탭 동기화
     - months: 오프셋 튜플 (기본: 이번 달 + 지난 달)
@@ -817,21 +833,30 @@ def sync_unified_member_list() -> dict:
 
     sh = gc.open_by_key(SALARY_SPREADSHEET_ID)
 
-    # 1. 회원명부에서 이름들 수집
+    # 1. 회원명부에서 이름들 수집 (등록회원과 OT만 회원 구분)
     member_ws = sh.worksheet("👥회원명부")
     member_data = member_ws.get_all_values()
-    member_names = set()
-    member_info = {}  # name -> "5+10회" 같은 요약
+    member_names = set()      # 등록한 회원 (패키지 또는 개인 회차 있음)
+    ot_only_names = set()     # 회원명부에 있지만 OT만 (등록 0회)
+    member_info = {}
+    def _num(s):
+        s = str(s).replace(",","").replace("원","").replace("회","").strip()
+        try: return float(s or 0)
+        except: return 0
     for row in member_data[4:]:
         if row and row[0].strip():
             n = NAME_ALIASES.get(row[0].strip(), row[0].strip())
-            member_names.add(n)
             pkg = row[1].strip() if len(row) > 1 else ""
             prv = row[3].strip() if len(row) > 3 else ""
+            has_reg = _num(pkg) > 0 or _num(prv) > 0
+            if has_reg:
+                member_names.add(n)
+            else:
+                ot_only_names.add(n)
             parts = []
-            if pkg and pkg not in ("0", "0회"): parts.append(f"패키지 {pkg}")
-            if prv and prv not in ("0", "0회"): parts.append(f"개인 {prv}")
-            member_info[n] = " / ".join(parts) or "-"
+            if _num(pkg) > 0: parts.append(f"패키지 {pkg}")
+            if _num(prv) > 0: parts.append(f"개인 {prv}")
+            member_info[n] = " / ".join(parts) or "OT만"
 
     # 2. OT관리표 (이번+지난달) 이름 + 성별 추출
     src = gc.open_by_key(SOURCE_MEMBER_SHEET_ID)
@@ -879,25 +904,32 @@ def sync_unified_member_list() -> dict:
     except gspread.WorksheetNotFound:
         pass
 
-    # 4. 이름 통합 + 성별 결정
-    all_names = member_names | set(ot_names.keys())
+    # 4. 이름 통합 + 성별 결정 + OT만 여부
+    # 등록 회원: 회원명부에 등록회차 있음 → 카운트 대상
+    # OT만: 회원명부에 있지만 등록 0, 또는 OT관리표에만 있는 회원 → 카운트 제외
+    all_names = member_names | ot_only_names | set(ot_names.keys())
     unified = []
     for n in sorted(all_names, key=lambda x: (x not in member_names, x not in ot_names, x)):
-        # 성별 결정: 사용자편집 > SEED (도움 직접 확인) > OT suffix > 미상
         gender = user_gender.get(n) or GENDER_SEED.get(n) or ot_names.get(n, {}).get("gender") or "미상"
         source = []
         if n in member_names: source.append("📅회원명부")
+        elif n in ot_only_names: source.append("📅회원명부(OT만)")
         if n in ot_names: source.append("📋OT관리표")
-        info = member_info.get(n, "-")
+        info = member_info.get(n, "OT만")
         note = ot_names.get(n, {}).get("note", "")
-        unified.append([n, gender, " + ".join(source), info, note])
+        # OT만 회원 판별: 등록 회원 리스트에 없으면 OT만
+        is_ot_only = n not in member_names
+        status = "OT만" if is_ot_only else "등록"
+        unified.append([n, gender, status, " + ".join(source), info, note])
 
-    # 5. 카운트
-    male = [u[0] for u in unified if u[1] == "남"]
-    female = [u[0] for u in unified if u[1] == "여"]
-    unknown = [u[0] for u in unified if u[1] not in ("남", "여")]
+    # 5. 카운트 (등록 회원만)
+    active = [u for u in unified if u[2] == "등록"]
+    ot_only_list = [u for u in unified if u[2] == "OT만"]
+    male = [u[0] for u in active if u[1] == "남"]
+    female = [u[0] for u in active if u[1] == "여"]
+    unknown = [u[0] for u in active if u[1] not in ("남", "여")]
 
-    # 6. 시트 준비/갱신
+    # 6. 시트 준비/갱신 (6개 열: 이름, 성별, 구분, 출처, 등록정보, 특이사항)
     try:
         uni_ws = sh.worksheet(UNIFIED_SHEET_NAME)
         uni_ws.clear()
@@ -905,7 +937,7 @@ def sync_unified_member_list() -> dict:
     except gspread.WorksheetNotFound:
         req = {"addSheet": {"properties": {
             "title": UNIFIED_SHEET_NAME,
-            "gridProperties": {"rowCount": len(unified) + 20, "columnCount": 5},
+            "gridProperties": {"rowCount": len(unified) + 20, "columnCount": 6},
         }}}
         res = service.spreadsheets().batchUpdate(
             spreadsheetId=SALARY_SPREADSHEET_ID, body={"requests": [req]}
@@ -915,44 +947,44 @@ def sync_unified_member_list() -> dict:
 
     now_kr = datetime.now(timezone(timedelta(hours=9)))
     out = [
-        [f"🧑 통합 회원 리스트 (회원명부 + OT관리표)", "", "", "", ""],
-        [f"💡 성별은 직접 수정 가능. 다음 sync에서 편집값 보존됨.  ·  갱신: {now_kr.strftime('%Y-%m-%d %H:%M')}", "", "", "", ""],
-        ["", "", "", "", ""],
-        ["이름", "성별", "출처", "등록정보", "특이사항"],
+        ["🧑 통합 회원 리스트 (회원명부 + OT관리표)"] + [""] * 5,
+        [f"💡 성별 직접 수정 가능(다음 sync에서 보존).  ·  갱신: {now_kr.strftime('%Y-%m-%d %H:%M')}"] + [""] * 5,
+        [""] * 6,
+        ["이름", "성별", "구분", "출처", "등록정보", "특이사항"],
     ]
     for u in unified:
         out.append(u)
 
     # 카운트 요약 행
-    out.append(["", "", "", "", ""])
+    out.append([""] * 6)
     out.append([
-        f"📊 총 {len(unified)}명",
+        f"📊 등록회원 {len(active)}명",
         f"남 {len(male)}",
         f"여 {len(female)}",
         f"미상 {len(unknown)}",
+        f"(OT만 {len(ot_only_list)}명 별도)",
         "",
     ])
 
-    uni_ws.update(range_name=f"A1:E{len(out)}", values=out, value_input_option="USER_ENTERED")
+    uni_ws.update(range_name=f"A1:F{len(out)}", values=out, value_input_option="USER_ENTERED")
 
     # 서식
     header_row = 4
     total_row = len(out)
+    end_col = 6  # A-F
     fmt_requests = [
-        # 제목
         {"repeatCell": {
-            "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 5},
+            "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": end_col},
             "cell": {"userEnteredFormat": {
                 "backgroundColor": {"red": 0.26, "green": 0.52, "blue": 0.96},
                 "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1}, "bold": True, "fontSize": 12},
             }},
             "fields": "userEnteredFormat(backgroundColor,textFormat)",
         }},
-        {"mergeCells": {"range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 5}, "mergeType": "MERGE_ALL"}},
-        {"mergeCells": {"range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": 5}, "mergeType": "MERGE_ALL"}},
-        # 헤더 행
+        {"mergeCells": {"range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": end_col}, "mergeType": "MERGE_ALL"}},
+        {"mergeCells": {"range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": end_col}, "mergeType": "MERGE_ALL"}},
         {"repeatCell": {
-            "range": {"sheetId": sheet_id, "startRowIndex": header_row - 1, "endRowIndex": header_row, "startColumnIndex": 0, "endColumnIndex": 5},
+            "range": {"sheetId": sheet_id, "startRowIndex": header_row - 1, "endRowIndex": header_row, "startColumnIndex": 0, "endColumnIndex": end_col},
             "cell": {"userEnteredFormat": {
                 "backgroundColor": {"red": 0.90, "green": 0.90, "blue": 0.95},
                 "textFormat": {"bold": True},
@@ -960,9 +992,8 @@ def sync_unified_member_list() -> dict:
             }},
             "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
         }},
-        # 합계 행
         {"repeatCell": {
-            "range": {"sheetId": sheet_id, "startRowIndex": total_row - 1, "endRowIndex": total_row, "startColumnIndex": 0, "endColumnIndex": 5},
+            "range": {"sheetId": sheet_id, "startRowIndex": total_row - 1, "endRowIndex": total_row, "startColumnIndex": 0, "endColumnIndex": end_col},
             "cell": {"userEnteredFormat": {
                 "backgroundColor": {"red": 1, "green": 0.95, "blue": 0.80},
                 "textFormat": {"bold": True, "fontSize": 11},
@@ -970,12 +1001,19 @@ def sync_unified_member_list() -> dict:
             }},
             "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
         }},
-        # 열 너비 (이름 100, 성별 60, 출처 180, 등록 150, 특이사항 300)
+        # OT만 행 회색으로
+        *[{"repeatCell": {
+            "range": {"sheetId": sheet_id, "startRowIndex": header_row + i, "endRowIndex": header_row + i + 1, "startColumnIndex": 0, "endColumnIndex": end_col},
+            "cell": {"userEnteredFormat": {"backgroundColor": {"red": 0.95, "green": 0.95, "blue": 0.95}, "textFormat": {"foregroundColor": {"red": 0.5, "green": 0.5, "blue": 0.5}}}},
+            "fields": "userEnteredFormat(backgroundColor,textFormat)",
+        }} for i, u in enumerate(unified) if u[2] == "OT만"],
+        # 열 너비
         {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 100}, "fields": "pixelSize"}},
         {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2}, "properties": {"pixelSize": 60}, "fields": "pixelSize"}},
-        {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 3}, "properties": {"pixelSize": 200}, "fields": "pixelSize"}},
-        {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 3, "endIndex": 4}, "properties": {"pixelSize": 150}, "fields": "pixelSize"}},
-        {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 4, "endIndex": 5}, "properties": {"pixelSize": 320}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 3}, "properties": {"pixelSize": 70}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 3, "endIndex": 4}, "properties": {"pixelSize": 200}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 4, "endIndex": 5}, "properties": {"pixelSize": 150}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 5, "endIndex": 6}, "properties": {"pixelSize": 320}, "fields": "pixelSize"}},
     ]
     try:
         service.spreadsheets().batchUpdate(
@@ -984,13 +1022,14 @@ def sync_unified_member_list() -> dict:
     except Exception as e:
         logger.warning(f"[통합회원] 서식 실패: {e}")
 
-    logger.info(f"[통합회원] 완료: 총 {len(unified)} (남 {len(male)} 여 {len(female)} 미상 {len(unknown)})")
+    logger.info(f"[통합회원] 완료: 등록 {len(active)} (남 {len(male)} 여 {len(female)} 미상 {len(unknown)}) + OT만 {len(ot_only_list)}")
     return {
-        "total": len(unified),
+        "active": len(active),
         "male": len(male),
         "female": len(female),
         "unknown": len(unknown),
         "unknown_names": unknown,
+        "ot_only": len(ot_only_list),
     }
 
 
