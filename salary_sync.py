@@ -56,7 +56,7 @@ SCOPES = [
 
 # ---------- 정규식 ----------
 NAME_PART = r"([^-]+?)(?:님)?"
-TYPE_PART = r"(?:-(신규|재등)(?:\(.+?\))?)?"
+TYPE_PART = r"(?:-(신규|재등|인계)(?:\(.+?\))?)?"
 
 PATTERN_A = re.compile(rf"^{TRAINER_NAME}-{NAME_PART}{TYPE_PART}-(\d+)s?\+(\d+)s?/(\d+)s?$")
 PATTERN_B = re.compile(rf"^{TRAINER_NAME}-{NAME_PART}{TYPE_PART}-(\d+)s?/(\d+)s?(?:\+(\d+)s?)?$")
