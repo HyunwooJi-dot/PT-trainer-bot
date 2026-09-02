@@ -666,10 +666,20 @@ def _fetch_month_data(source_sh, tab_name):
     except ValueError:
         trainer_col = 5
 
-    filtered = [
-        row for row in data_rows
-        if len(row) > trainer_col and row[trainer_col].strip() == TRAINER_FULLNAME
-    ]
+    # 특이사항 열 (임의작성 행 제외용)
+    try:
+        note_col = header.index("특이사항")
+    except ValueError:
+        note_col = 2
+
+    filtered = []
+    for row in data_rows:
+        if len(row) <= trainer_col or row[trainer_col].strip() != TRAINER_FULLNAME:
+            continue
+        # 특이사항에 "임의작성" 포함되면 제외
+        if len(row) > note_col and "임의작성" in row[note_col]:
+            continue
+        filtered.append(row)
     return header, filtered
 
 
