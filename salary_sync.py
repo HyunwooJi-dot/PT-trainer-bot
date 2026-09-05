@@ -61,6 +61,8 @@ TYPE_PART = r"(?:-(신규|재등|인계)(?:\(.+?\))?)?"
 PATTERN_A = re.compile(rf"^{TRAINER_NAME}-{NAME_PART}{TYPE_PART}-(\d+)s?\+(\d+)s?/(\d+)s?$")
 PATTERN_B = re.compile(rf"^{TRAINER_NAME}-{NAME_PART}{TYPE_PART}-(\d+)s?/(\d+)s?(?:\+(\d+)s?)?$")
 PATTERN_C = re.compile(rf"^{TRAINER_NAME}-{NAME_PART}{TYPE_PART}-(\d+)회$")
+# P/n : 개인 명시 태그 (5+X 회원의 개인 파트 시작, 매출 몰빵 X, 수업료만 계산)
+PATTERN_PERSONAL = re.compile(rf"^{TRAINER_NAME}-{NAME_PART}{TYPE_PART}-[Pp]/(\d+)s?$")
 PATTERN_OT = re.compile(rf"^{TRAINER_NAME}-{NAME_PART}[\s\-]+OT.*$")
 PATTERN_TRAINER = re.compile(rf"^{TRAINER_NAME}[\s\-]+.+$")
 
@@ -154,6 +156,17 @@ def parse_event(event: dict) -> dict | None:
             "title": title, "is_oneshot": True,
         }
 
+    m = PATTERN_PERSONAL.match(title)
+    if m:
+        name, reg_type, n = m.groups()
+        return {
+            "date": date_str, "time": time_str, "name": name.strip(),
+            "reg_type": reg_type or "신규",
+            "total_sessions": 0, "extra_sessions": 0, "progress": int(n),
+            "title": title, "is_oneshot": False,
+            "is_personal_explicit": True,  # P/n = 개인 명시, 매출 몰빵 대상 아님
+        }
+
     m = PATTERN_OT.match(title)
     if m:
         return {
@@ -172,6 +185,8 @@ def classify_session(session: dict) -> str:
     """세션 종류 판정: 'OT' | '패키지' | '개인'"""
     if session.get("is_ot"):
         return "OT"
+    if session.get("is_personal_explicit"):
+        return "개인"  # P/n 태그는 무조건 개인 (5+X 회원의 개인 파트)
     total = session.get("total_sessions", 0)
     if total == 5:
         return "패키지"
@@ -186,8 +201,14 @@ def calc_session_revenue(session: dict, member_info: dict | None) -> int:
     - X/1 (X≠5)  → 개인총금액 (순수 개인)
     - 5+X/1      → 8만원 + 개인총금액 (혼합)
     - progress > 1 세션 → 0 (이미 등록월에 잡힘)
+    - P/n 개인 명시 → 0 (5+X의 개인 파트, 이미 5/1+X 첫 세션에서 몰빵됨)
+    - 인계 → 0 (이전 트레이너가 등록비 수령)
     """
     if session.get("is_ot"):
+        return 0
+    if session.get("is_personal_explicit"):
+        return 0
+    if session.get("reg_type") == "인계":
         return 0
     if session.get("progress", 0) != 1:
         return 0
@@ -319,7 +340,10 @@ def sync_month(year: int = None, month: int = None) -> dict:
         for name, info in unknown_members.items():
             has_pkg = info["패키지등록"] == 5
             has_prv = info["개인회차"] > 0
-            if has_pkg and has_prv:
+            is_takeover = info.get("reg_type") == "인계"
+            if is_takeover:
+                memo = "🤖 인계 - 회당단가 입력 필요 (매출 몰빵 X)"
+            elif has_pkg and has_prv:
                 memo = "🤖 5+X 혼합 - 개인총금액 입력 필요"
             elif has_pkg:
                 memo = "🤖 패키지 신규 (자동)"
@@ -403,8 +427,12 @@ def sync_month(year: int = None, month: int = None) -> dict:
         kind = classify_session(s)
 
         # 이 세션이 이달 첫 등록 세션인지 (매출 몰빵 대상)
+        # 제외: OT, P/n 태그(이미 이전 등록에서 몰빵됨), 인계(이전 트레이너가 등록비 수령)
         is_first_charge = 0
-        if not s.get("is_ot") and s.get("progress", 0) == 1:
+        if (not s.get("is_ot")
+            and not s.get("is_personal_explicit")
+            and s.get("reg_type") != "인계"
+            and s.get("progress", 0) == 1):
             if target_name not in first_charge_seen:
                 is_first_charge = 1
                 first_charge_seen.add(target_name)
@@ -413,8 +441,11 @@ def sync_month(year: int = None, month: int = None) -> dict:
         revenue_val = calc_session_revenue(s, member_info) if is_first_charge else 0
 
         # 진행회차 표기 - 도움 표기법: 5/N+X (앞: 패키지 진행, 뒤: 개인 대기)
+        # P/n : 5+X 회원의 개인 파트 (P로 유지, 그래프/필터 편의)
         if s.get("is_ot"):
             progress_str = "OT"
+        elif s.get("is_personal_explicit"):
+            progress_str = f"P/{s.get('progress', 0)}"
         else:
             total = s.get("total_sessions", 0)
             extra = s.get("extra_sessions", 0)
